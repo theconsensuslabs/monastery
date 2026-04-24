@@ -579,7 +579,15 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 				rows.Scan(ptrs...)
 				row := make([]any, len(vals))
 				copy(row, vals)
-				resultParts = append(resultParts, fmt.Sprintf("%v", row))
+				parts := make([]string, len(row))
+				for i, v := range row {
+					if b, ok := v.([]byte); ok {
+						parts[i] = string(b)
+					} else {
+						parts[i] = fmt.Sprintf("%v", v)
+					}
+				}
+				resultParts = append(resultParts, "["+strings.Join(parts, " ")+"]")
 				resultRows = append(resultRows, row)
 			}
 		}
