@@ -14,4 +14,4 @@ t2: update test set value = 18 where id = 2;
 t2: commit;
 
 t1: delete from test where value = 20; -- Should error on repeatable-read+.
-t1: abort;
+t1: rollback;
