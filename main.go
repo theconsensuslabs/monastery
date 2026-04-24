@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"flag"
@@ -20,18 +21,34 @@ import (
 	"github.com/gdamore/tcell/v2"
 )
 
+func newUUID() string {
+	var b [16]byte
+	rand.Read(b[:])
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
 type step struct {
 	clientID string
 	sql      string
 	notes    string
 }
 
-func parseScript(f *os.File) ([]step, error) {
-	var steps []step
+func parseScript(f *os.File) (preconditions []string, steps []step, err error) {
 	scanner := bufio.NewScanner(f)
+	seenSeparator := false
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if line == "---" {
+			seenSeparator = true
+			continue
+		}
+		if !seenSeparator {
+			preconditions = append(preconditions, line)
 			continue
 		}
 		var notes string
@@ -48,28 +65,49 @@ func parseScript(f *os.File) ([]step, error) {
 			steps = append(steps, step{strings.TrimSpace(parts[0]), query, notes})
 		}
 	}
-	return steps, scanner.Err()
+	if !seenSeparator {
+		// no separator: everything was steps, not preconditions
+		for _, line := range preconditions {
+			var notes string
+			if idx := strings.Index(line, "--"); idx != -1 {
+				notes = strings.TrimSpace(line[idx+2:])
+				line = line[:idx]
+			}
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) < 2 {
+				continue
+			}
+			query := strings.TrimSpace(parts[1])
+			if query != "" {
+				steps = append(steps, step{strings.TrimSpace(parts[0]), query, notes})
+			}
+		}
+		preconditions = nil
+	}
+	return preconditions, steps, scanner.Err()
 }
 
 
 // --- logger -----------------------------------------------------------------
 
 type logger struct {
-	mu sync.Mutex
-	f  *os.File
+	mu    sync.Mutex
+	f     *os.File
+	runID string
 }
 
-func newLogger(path string) (*logger, error) {
+func newLogger(path string, runID string) (*logger, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, err
 	}
-	return &logger{f: f}, nil
+	return &logger{f: f, runID: runID}, nil
 }
 
 func (l *logger) write(event map[string]any) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	event["run_id"] = l.runID
 	b, _ := json.Marshal(event)
 	l.f.Write(b)
 	l.f.Write([]byte("\n"))
@@ -637,7 +675,7 @@ func main() {
 	}
 	defer f.Close()
 
-	steps, err := parseScript(f)
+	preconditions, steps, err := parseScript(f)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "parse script:", err)
 		os.Exit(1)
@@ -650,7 +688,9 @@ func main() {
 	}
 	defer db.Close()
 
-	lg, err := newLogger(*logPath)
+	runID := newUUID()
+
+	lg, err := newLogger(*logPath, runID)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open log:", err)
 		os.Exit(1)
@@ -662,9 +702,43 @@ func main() {
 		"time":            time.Now().Format(time.RFC3339Nano),
 		"driver":          driver,
 		"isolation_level": isolationLevel,
-		"script":          scriptPath,
 		"interval_ms":     interval.Milliseconds(),
 	})
+
+	if len(preconditions) > 0 {
+		conn, err := db.Conn(context.Background())
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "precondition conn:", err)
+			os.Exit(1)
+		}
+		for _, sql := range preconditions {
+			start := time.Now()
+			lg.write(map[string]any{
+				"event":   "precondition_start",
+				"command": sql,
+				"time":    start.Format(time.RFC3339Nano),
+				"driver": driver,
+			})
+			_, execErr := conn.ExecContext(context.Background(), sql)
+			end := time.Now()
+			event := map[string]any{
+				"event":      "precondition_end",
+				"command":    sql,
+				"start_time": start.Format(time.RFC3339Nano),
+				"end_time":   end.Format(time.RFC3339Nano),
+				"elapsed_ms": end.Sub(start).Milliseconds(),
+			}
+			if execErr != nil {
+				event["error"] = execErr.Error()
+				lg.write(event)
+				conn.Close()
+				fmt.Fprintf(os.Stderr, "precondition %q: %v\n", sql, execErr)
+				os.Exit(1)
+			}
+			lg.write(event)
+		}
+		conn.Close()
+	}
 
 	sc, err := newScreen()
 	if err != nil {
@@ -675,6 +749,8 @@ func main() {
 		if sc.dump != "" {
 			fmt.Print(sc.dump)
 		}
+
+		fmt.Println(runID)
 	}()
 	sc.interactive = *interactive
 

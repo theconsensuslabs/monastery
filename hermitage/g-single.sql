@@ -1,8 +1,8 @@
-t0: drop table if exists test;
-t0: create table test (id int primary key, value int);
-t0: insert into test (id, value) values (1, 10), (2, 20);
+drop table if exists test;
+create table test (id int primary key, value int);
+insert into test (id, value) values (1, 10), (2, 20);
 
-sync
+---
 
 t1: begin;
 t2: begin;
