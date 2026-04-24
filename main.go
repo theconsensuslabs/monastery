@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	_ "github.com/mattn/go-sqlite3"
 )
 
 type step struct {
@@ -52,35 +51,6 @@ func parseScript(f *os.File) ([]step, error) {
 	return steps, scanner.Err()
 }
 
-func isolationSQL(driver, level string) string {
-	var cmd string
-	var levels map[string]string
-	switch driver {
-	case "mysql":
-		levels = map[string]string{
-			"read-uncommitted": "READ UNCOMMITTED",
-			"read-committed":   "READ COMMITTED",
-			"repeatable-read":  "REPEATABLE READ",
-			"serializable":     "SERIALIZABLE",
-		}
-		cmd = "SET TRANSACTION ISOLATION LEVEL " + levels[level]
-	case "postgres":
-		levels = map[string]string{
-			"read-committed":  "READ COMMITTED",
-			"repeatable-read": "REPEATABLE READ",
-			"serializable":    "SERIALIZABLE",
-		}
-		cmd = "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL " + levels[level]
-	case "sqlite3":
-		levels = map[string]string{"serializable": ""}
-		cmd = "SELECT 1"
-	}
-
-	if _, ok := levels[level]; !ok {
-		log.Fatalf("unknown log level %s for database %s", level, driver)
-	}
-	return cmd
-}
 
 // --- logger -----------------------------------------------------------------
 
@@ -208,6 +178,31 @@ type screen struct {
 	s            tcell.Screen
 	rows         []rowData
 	scrollOffset int
+	interactive  bool
+	allDone      bool
+	dump         string
+}
+
+func (sc *screen) captureDump() string {
+	w, h := sc.s.Size()
+	var sb strings.Builder
+	line := make([]rune, w)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			mainc, _, _, _ := sc.s.GetContent(x, y)
+			if mainc == 0 {
+				mainc = ' '
+			}
+			line[x] = mainc
+		}
+		sb.WriteString(strings.TrimRight(string(line), " "))
+		sb.WriteRune('\n')
+	}
+	out := sb.String()
+	if idx := strings.LastIndex(out, "┘\n"); idx != -1 {
+		out = out[:idx+len("┘\n")]
+	}
+	return out
 }
 
 func newScreen() (*screen, error) {
@@ -224,7 +219,7 @@ func newScreen() (*screen, error) {
 	return sc, nil
 }
 
-func (sc *screen) pollEvents(cancel context.CancelFunc) {
+func (sc *screen) pollEvents(cancel context.CancelFunc, nextStep chan<- struct{}) {
 	for {
 		ev := sc.s.PollEvent()
 		switch ev := ev.(type) {
@@ -234,9 +229,26 @@ func (sc *screen) pollEvents(cancel context.CancelFunc) {
 				sc.scroll(-1)
 			case tcell.KeyDown:
 				sc.scroll(1)
-			default:
+			case tcell.KeyEscape:
+				sc.mu.Lock()
+				sc.dump = sc.captureDump()
+				sc.mu.Unlock()
 				cancel()
 				return
+			default:
+				if ev.Rune() == 'q' || ev.Rune() == 'Q' {
+					sc.mu.Lock()
+					sc.dump = sc.captureDump()
+					sc.mu.Unlock()
+					cancel()
+					return
+				}
+				if sc.interactive && nextStep != nil {
+					select {
+					case nextStep <- struct{}{}:
+					default:
+					}
+				}
 			}
 		case *tcell.EventResize:
 			sc.mu.Lock()
@@ -418,12 +430,28 @@ func (sc *screen) redrawAll() {
 		}
 	}
 	total := sc.totalContentLines()
-	_, h2 := sc.s.Size()
+	w, h2 := sc.s.Size()
 	if sc.scrollOffset+h2-headerLines < total {
 		hint := " ↓ more "
 		for i, ch := range []rune(hint) {
 			sc.s.SetContent(i, h2-1, ch, nil, tcell.StyleDefault.Dim(true))
 		}
+	}
+
+	var keyHint string
+	if sc.interactive && !sc.allDone {
+		keyHint = " any key: next step · q/Esc: quit "
+	} else {
+		keyHint = " q/Esc: quit "
+	}
+	hintRunes := []rune(keyHint)
+	startX := w - len(hintRunes)
+	if startX < 0 {
+		startX = 0
+	}
+	dimStyle := tcell.StyleDefault.Dim(true)
+	for i, ch := range hintRunes {
+		sc.s.SetContent(startX+i, h2-1, ch, nil, dimStyle)
 	}
 
 	sc.s.Show()
@@ -558,32 +586,48 @@ func defaultPluginDir() string {
 
 func main() {
 	interval := flag.Duration("interval", 3*time.Second, "delay between dispatching each step (e.g. 500ms, 1s, 1m)")
+	interactive := flag.Bool("interactive", false, "wait for any keypress before dispatching each step")
+	run := flag.Bool("run", false, "dispatch all steps immediately, dump output, and exit")
 	logPath := flag.String("log", "monastery.jsonl", "path to JSON log file")
 	pluginDir := flag.String("plugin-dir", defaultPluginDir(), "directory containing driver plugin .so files")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) < 4 {
-		fmt.Fprintln(os.Stderr, "usage: monastery [-interval <duration>] [-log <path>] <driver> <dsn> <isolation level> <script>")
+		fmt.Fprintln(os.Stderr, "usage: monastery [-interval <duration>] [-interactive] [-log <path>] <driver> <dsn> <isolation level> <script>")
 		fmt.Fprintln(os.Stderr, "  -interval duration  delay between steps (default 3s, e.g. 500ms, 1m)")
+		fmt.Fprintln(os.Stderr, "  -interactive        wait for keypress before each step instead of using interval")
+		fmt.Fprintln(os.Stderr, "  -run                dispatch all steps immediately, dump output, and exit")
 		fmt.Fprintln(os.Stderr, "  -log path           json log file (default monastery.jsonl)")
 		fmt.Fprintln(os.Stderr, "  isolation levels: read-uncommitted, read-committed, repeatable-read, serializable")
-		fmt.Fprintln(os.Stderr, "  drivers: mysql, postgres, sqlite3")
+		fmt.Fprintln(os.Stderr, "  drivers: mysql, postgres (loaded from <driver>.so plugin)")
 		fmt.Fprintln(os.Stderr, "  mysql:    root:pass@tcp(127.0.0.1:3306)/dbname")
 		fmt.Fprintln(os.Stderr, "  postgres: host=localhost user=postgres dbname=test sslmode=disable")
-		fmt.Fprintln(os.Stderr, "  sqlite3:  ./test.db")
 		os.Exit(1)
 	}
 
 	driver, dsn, isolationLevel, scriptPath := args[0], args[1], args[2], args[3]
 
-	switch driver {
-	case "postgres", "mysql":
-		pluginPath := filepath.Join(*pluginDir, driver+".so")
-		if _, err := plugin.Open(pluginPath); err != nil {
-			fmt.Fprintf(os.Stderr, "load driver plugin %s: %v\n", pluginPath, err)
-			os.Exit(1)
-		}
+	pluginPath := filepath.Join(*pluginDir, driver+".so")
+	p, err := plugin.Open(pluginPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load driver plugin %s: %v\n", pluginPath, err)
+		os.Exit(1)
+	}
+	sym, err := p.Lookup("IsolationSQL")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "plugin %s missing IsolationSQL symbol\n", pluginPath)
+		os.Exit(1)
+	}
+	isolationSQLFn, ok := sym.(func(string) string)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "plugin %s: IsolationSQL has wrong type\n", pluginPath)
+		os.Exit(1)
+	}
+	setSQL := isolationSQLFn(isolationLevel)
+	if setSQL == "" {
+		fmt.Fprintf(os.Stderr, "unknown isolation level %q for driver %s\n", isolationLevel, driver)
+		os.Exit(1)
 	}
 
 	f, err := os.Open(scriptPath)
@@ -626,12 +670,24 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer sc.fini()
+	defer func() {
+		sc.fini()
+		if sc.dump != "" {
+			fmt.Print(sc.dump)
+		}
+	}()
+	sc.interactive = *interactive
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go sc.pollEvents(cancel)
+	var nextStep chan struct{}
+	if *interactive {
+		nextStep = make(chan struct{}, 1)
+	}
+	if !*run {
+		go sc.pollEvents(cancel, nextStep)
+	}
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -639,8 +695,6 @@ func main() {
 		<-sigs
 		cancel()
 	}()
-
-	setSQL := isolationSQL(driver, isolationLevel)
 
 	clientChans := map[string]chan step{}
 	var wg sync.WaitGroup
@@ -670,14 +724,29 @@ func main() {
 		}
 	}
 
-	ticker := time.NewTicker(*interval)
-	defer ticker.Stop()
-	for _, s := range steps {
-		clientChans[s.clientID] <- s
-		select {
-		case <-ctx.Done():
-			goto shutdown
-		case <-ticker.C:
+	if *run {
+		for _, s := range steps {
+			clientChans[s.clientID] <- s
+		}
+	} else if *interactive {
+		for _, s := range steps {
+			clientChans[s.clientID] <- s
+			select {
+			case <-ctx.Done():
+				goto shutdown
+			case <-nextStep:
+			}
+		}
+	} else {
+		ticker := time.NewTicker(*interval)
+		defer ticker.Stop()
+		for _, s := range steps {
+			clientChans[s.clientID] <- s
+			select {
+			case <-ctx.Done():
+				goto shutdown
+			case <-ticker.C:
+			}
 		}
 	}
 
@@ -689,6 +758,16 @@ func main() {
 		"event": "session_end",
 		"time":  time.Now().Format(time.RFC3339Nano),
 	})
+	if *run {
+		sc.mu.Lock()
+		sc.dump = sc.captureDump()
+		sc.mu.Unlock()
+		return
+	}
+	sc.mu.Lock()
+	sc.allDone = true
+	sc.redrawAll()
+	sc.mu.Unlock()
 	<-ctx.Done()
 	return
 

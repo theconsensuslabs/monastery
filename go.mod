@@ -6,7 +6,6 @@ require (
 	github.com/gdamore/tcell/v2 v2.13.9
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/lib/pq v1.12.3
-	github.com/mattn/go-sqlite3 v1.14.42
 )
 
 require (
