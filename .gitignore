@@ -1,0 +1,7 @@
+*~
+*.so
+monastery
+*.jsonl
+testdb
+*.db
+.claude

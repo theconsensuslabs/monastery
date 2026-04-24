@@ -10,14 +10,14 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"plugin"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	_ "github.com/go-sql-driver/mysql"
-	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -124,12 +124,12 @@ const (
 
 var colWidths = [numCols]int{
 	10, // client
-	40, // command
+	60, // command
 	14, // start
 	14, // end
 	20, // results
 	40, // error
-	40, // notes
+	50, // notes
 }
 
 var colHeaders = [numCols]string{
@@ -548,9 +548,18 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 
 // --- main -------------------------------------------------------------------
 
+func defaultPluginDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	return filepath.Dir(exe)
+}
+
 func main() {
 	interval := flag.Duration("interval", 3*time.Second, "delay between dispatching each step (e.g. 500ms, 1s, 1m)")
 	logPath := flag.String("log", "monastery.jsonl", "path to JSON log file")
+	pluginDir := flag.String("plugin-dir", defaultPluginDir(), "directory containing driver plugin .so files")
 	flag.Parse()
 
 	args := flag.Args()
@@ -567,6 +576,15 @@ func main() {
 	}
 
 	driver, dsn, isolationLevel, scriptPath := args[0], args[1], args[2], args[3]
+
+	switch driver {
+	case "postgres", "mysql":
+		pluginPath := filepath.Join(*pluginDir, driver+".so")
+		if _, err := plugin.Open(pluginPath); err != nil {
+			fmt.Fprintf(os.Stderr, "load driver plugin %s: %v\n", pluginPath, err)
+			os.Exit(1)
+		}
+	}
 
 	f, err := os.Open(scriptPath)
 	if err != nil {
