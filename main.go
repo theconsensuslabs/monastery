@@ -783,18 +783,32 @@ func main() {
 	clientChans := map[string]chan step{}
 	var wg sync.WaitGroup
 
+	var workerConnsMu sync.Mutex
+	var workerConns []*sql.Conn
+	go func() {
+		<-ctx.Done()
+		workerConnsMu.Lock()
+		defer workerConnsMu.Unlock()
+		for _, c := range workerConns {
+			c.Close()
+		}
+	}()
+
 	for _, s := range steps {
 		if _, ok := clientChans[s.clientID]; !ok {
-			conn, err := db.Conn(ctx)
+			conn, err := db.Conn(context.Background())
 			if err != nil {
 				sc.fini()
 				fmt.Fprintln(os.Stderr, "get conn:", err)
 				os.Exit(1)
 			}
-			if _, err := conn.ExecContext(ctx, setSQL); err != nil {
+			if _, err := conn.ExecContext(context.Background(), setSQL); err != nil {
 				sc.fini()
 				log.Fatalf("set isolation level on %s: %v", s.clientID, err)
 			}
+			workerConnsMu.Lock()
+			workerConns = append(workerConns, conn)
+			workerConnsMu.Unlock()
 
 			ch := make(chan step, len(steps))
 			clientChans[s.clientID] = ch
@@ -802,7 +816,6 @@ func main() {
 			wg.Add(1)
 			go func(id string, c *sql.Conn, ch chan step) {
 				defer wg.Done()
-				defer c.Close()
 				clientWork(ctx, id, c, ch, sc, lg)
 			}(s.clientID, conn, ch)
 		}
