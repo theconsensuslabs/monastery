@@ -364,7 +364,7 @@ func (sc *screen) drawHRule(y int) {
 	sc.drawBorder(y, '├', '┼', '┤')
 }
 
-func (sc *screen) drawLogicalRow(y int, r rowData) int {
+func (sc *screen) drawLogicalRow(y int, r rowData, firstLine int) int {
 	defaultStyle := tcell.StyleDefault
 	pendingStyle := tcell.StyleDefault.Foreground(tcell.ColorYellow)
 	errorStyle := tcell.StyleDefault.Foreground(tcell.ColorRed)
@@ -386,8 +386,9 @@ func (sc *screen) drawLogicalRow(y int, r rowData) int {
 	wrapped, numLines := rowLines(r)
 	w := totalWidth()
 
-	for line := 0; line < numLines; line++ {
-		sy := y + line
+	drawn := 0
+	for line := firstLine; line < numLines; line++ {
+		sy := y + drawn
 		sc.s.SetContent(0, sy, '│', nil, defaultStyle)
 		sc.s.SetContent(w-1, sy, '│', nil, defaultStyle)
 		cx := 1
@@ -403,8 +404,9 @@ func (sc *screen) drawLogicalRow(y int, r rowData) int {
 			}
 			sc.putStr(colOffsets[col], sy, text, colWidths[col], styles[col])
 		}
+		drawn++
 	}
-	return numLines
+	return drawn
 }
 
 func (sc *screen) drawHeader() {
@@ -443,12 +445,17 @@ func (sc *screen) redrawAll() {
 		}
 
 		startLine := skipped - sc.scrollOffset
+		firstLine := 0
+		if startLine < 0 {
+			firstLine = -startLine
+			startLine = 0
+		}
 		screenY := headerLines + startLine
 		if screenY >= h {
 			break
 		}
 
-		drawn := sc.drawLogicalRow(screenY, r)
+		drawn := sc.drawLogicalRow(screenY, r, firstLine)
 		divY := screenY + drawn
 		if divY < h {
 			if i < len(sc.rows)-1 {
@@ -569,6 +576,7 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 		cols, _ := rows.Columns()
 		var resultParts []string
 		var resultRows [][]any
+		var scanErr error
 		if len(cols) > 0 {
 			vals := make([]any, len(cols))
 			ptrs := make([]any, len(cols))
@@ -576,7 +584,10 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 				ptrs[i] = &vals[i]
 			}
 			for rows.Next() {
-				rows.Scan(ptrs...)
+				if err := rows.Scan(ptrs...); err != nil {
+					scanErr = err
+					break
+				}
 				row := make([]any, len(vals))
 				copy(row, vals)
 				parts := make([]string, len(row))
@@ -591,8 +602,35 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 				resultRows = append(resultRows, row)
 			}
 		}
+		iterErr := rows.Err()
 		if err := rows.Close(); err != nil {
 			log.Fatalf("unexpected error on close [%s]: %s", id, err)
+		}
+		if scanErr != nil || iterErr != nil {
+			rowErr := scanErr
+			if rowErr == nil {
+				rowErr = iterErr
+			}
+			end := time.Now()
+			lg.write(map[string]any{
+				"event":      "query_end",
+				"client":     id,
+				"command":    s.sql,
+				"notes":      s.notes,
+				"start_time": start.Format(time.RFC3339Nano),
+				"end_time":   end.Format(time.RFC3339Nano),
+				"elapsed_ms": end.Sub(start).Milliseconds(),
+				"error":      rowErr.Error(),
+			})
+			sc.updateRow(idx, rowData{
+				client:  id,
+				command: s.sql,
+				start:   start.Format("15:04:05.000"),
+				end:     end.Format("15:04:05.000"),
+				err:     rowErr.Error(),
+				notes:   s.notes,
+			})
+			continue
 		}
 
 		end := time.Now()
@@ -640,16 +678,15 @@ func main() {
 
 	args := flag.Args()
 	if len(args) < 4 {
-		fmt.Fprintln(os.Stderr, "usage: monastery [-interval <duration>] [-interactive] [-log <path>] <driver> <dsn> <isolation level> <script>")
-		fmt.Fprintln(os.Stderr, "  -interval duration  delay between steps (default 3s, e.g. 500ms, 1m)")
-		fmt.Fprintln(os.Stderr, "  -interactive        wait for keypress before each step instead of using interval")
-		fmt.Fprintln(os.Stderr, "  -run                dispatch all steps immediately, dump output, and exit")
-		fmt.Fprintln(os.Stderr, "  -log path           json log file (default monastery.jsonl)")
-		fmt.Fprintln(os.Stderr, "  isolation levels: read-uncommitted, read-committed, repeatable-read, serializable")
-		fmt.Fprintln(os.Stderr, "  drivers: mysql, postgres (loaded from <driver>.so plugin)")
-		fmt.Fprintln(os.Stderr, "  mysql:    root:pass@tcp(127.0.0.1:3306)/dbname")
-		fmt.Fprintln(os.Stderr, "  postgres: host=localhost user=postgres dbname=test sslmode=disable")
-		os.Exit(1)
+		log.Fatal("usage: monastery [-interval <duration>] [-interactive] [-log <path>] <driver> <dsn> <isolation level> <script>\n" +
+			"  -interval duration  delay between steps (default 3s, e.g. 500ms, 1m)\n" +
+			"  -interactive        wait for keypress before each step instead of using interval\n" +
+			"  -run                dispatch all steps immediately, dump output, and exit\n" +
+			"  -log path           json log file (default monastery.jsonl)\n" +
+			"  isolation levels: read-uncommitted, read-committed, repeatable-read, serializable\n" +
+			"  drivers: mysql, postgres (loaded from <driver>.so plugin)\n" +
+			"  mysql:    root:pass@tcp(127.0.0.1:3306)/dbname\n" +
+			"  postgres: host=localhost user=postgres dbname=test sslmode=disable")
 	}
 
 	driver, dsn, isolationLevel, scriptPath := args[0], args[1], args[2], args[3]
@@ -657,42 +694,35 @@ func main() {
 	pluginPath := filepath.Join(*pluginDir, driver+".so")
 	p, err := plugin.Open(pluginPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "load driver plugin %s: %v\n", pluginPath, err)
-		os.Exit(1)
+		log.Fatalf("load driver plugin %s: %v", pluginPath, err)
 	}
 	sym, err := p.Lookup("IsolationSQL")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "plugin %s missing IsolationSQL symbol\n", pluginPath)
-		os.Exit(1)
+		log.Fatalf("plugin %s missing IsolationSQL symbol", pluginPath)
 	}
 	isolationSQLFn, ok := sym.(func(string) string)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "plugin %s: IsolationSQL has wrong type\n", pluginPath)
-		os.Exit(1)
+		log.Fatalf("plugin %s: IsolationSQL has wrong type", pluginPath)
 	}
 	setSQL := isolationSQLFn(isolationLevel)
 	if setSQL == "" {
-		fmt.Fprintf(os.Stderr, "unknown isolation level %q for driver %s\n", isolationLevel, driver)
-		os.Exit(1)
+		log.Fatalf("unknown isolation level %q for driver %s", isolationLevel, driver)
 	}
 
 	f, err := os.Open(scriptPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "open script:", err)
-		os.Exit(1)
+		log.Fatal("open script:", err)
 	}
 	defer f.Close()
 
 	preconditions, steps, err := parseScript(f)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "parse script:", err)
-		os.Exit(1)
+		log.Fatal("parse script:", err)
 	}
 
 	db, err := sql.Open(driver, dsn)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "open db:", err)
-		os.Exit(1)
+		log.Fatal("open db:", err)
 	}
 	defer db.Close()
 
@@ -700,8 +730,7 @@ func main() {
 
 	lg, err := newLogger(*logPath, runID)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "open log:", err)
-		os.Exit(1)
+		log.Fatal("open log:", err)
 	}
 	defer lg.close()
 
@@ -716,8 +745,7 @@ func main() {
 	if len(preconditions) > 0 {
 		conn, err := db.Conn(context.Background())
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "precondition conn:", err)
-			os.Exit(1)
+			log.Fatal("precondition conn:", err)
 		}
 		for _, sql := range preconditions {
 			start := time.Now()
@@ -740,8 +768,7 @@ func main() {
 				event["error"] = execErr.Error()
 				lg.write(event)
 				conn.Close()
-				fmt.Fprintf(os.Stderr, "precondition %q: %v\n", sql, execErr)
-				os.Exit(1)
+				log.Fatalf("precondition %q: %v", sql, execErr)
 			}
 			lg.write(event)
 		}
@@ -799,8 +826,7 @@ func main() {
 			conn, err := db.Conn(context.Background())
 			if err != nil {
 				sc.fini()
-				fmt.Fprintln(os.Stderr, "get conn:", err)
-				os.Exit(1)
+				log.Fatal("get conn:", err)
 			}
 			if _, err := conn.ExecContext(context.Background(), setSQL); err != nil {
 				sc.fini()
