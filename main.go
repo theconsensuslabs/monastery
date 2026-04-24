@@ -87,7 +87,6 @@ func parseScript(f *os.File) (preconditions []string, steps []step, err error) {
 	return preconditions, steps, scanner.Err()
 }
 
-
 // --- logger -----------------------------------------------------------------
 
 type logger struct {
@@ -753,7 +752,7 @@ func main() {
 				"event":   "precondition_start",
 				"command": sql,
 				"time":    start.Format(time.RFC3339Nano),
-				"driver": driver,
+				"driver":  driver,
 			})
 			_, execErr := conn.ExecContext(context.Background(), sql)
 			end := time.Now()
