@@ -1,6 +1,6 @@
 # Monastery
 
-A tool for testing transaction behavior.
+A tool for testing and observing transaction behavior.
 
 There are builtin scripts that use
 [Hermitage](https://github.com/ept/hermitage) test cases in

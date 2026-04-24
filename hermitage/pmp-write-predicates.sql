@@ -6,7 +6,7 @@ t1: begin
 t2: begin
 
 t1: update test set value = value + 10;
-t2: delete from test where value = 20; -- Repeatable read and stronger should block.
+t2: delete from test where value = 20;
 t1: commit;
-t2: select * from test where value = 20; -- Repeatable read and stronger should fail.
+t2: select * from test where value = 20; -- Should fail in repeatable-read+.
 t2: commit;
