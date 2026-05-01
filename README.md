@@ -45,7 +45,7 @@ $ ./monastery postgres 'host=localhost port=4000 sslmode=disable dbname=postgres
 ├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
 │t2        │commit;                                                     │10:05:39.147  │10:05:39.152  │                    │                                        │                                                  │
 ├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
-│t1        │select * from test where value % 3 = 0;                     │10:05:39.447  │10:05:39.454  │                    │                                        │OK []                                             │
+│t1        │select * from test where value % 3 = 0;                     │10:05:39.447  │10:05:39.454  │                    │                                        │OK ()                                             │
 ├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
 │t1        │commit;                                                     │10:05:39.747  │10:05:39.754  │                    │                                        │                                                  │
 └──────────┴────────────────────────────────────────────────────────────┴──────────────┴──────────────┴────────────────────┴────────────────────────────────────────┴──────────────────────────────────────────────────┘
@@ -104,15 +104,15 @@ exits non-zero if any assertion fails.
 |---------------------------------|--------------------------------------------|
 | `-- assert error`               | the statement returned an error            |
 | `-- assert ok`                  | the statement returned no error            |
-| `-- assert []`                  | the statement returned no rows             |
-| `-- assert [{1, 10}, {2, 20}]`  | the rows match exactly, in order           |
+| `-- assert ()`                  | the statement returned no rows             |
+| `-- assert ({1, 10}, {2, 20})`  | the rows match exactly, no order           |
 
 Alternatives can be chained with ` or ` and the assertion holds if any of
 them matches — useful when a step is allowed to either succeed with a
 specific result or fail with an error depending on the isolation level:
 
 ```sql
-t1: select * from test;  -- assert [{1, 12}, {2, 22}] or [{1, 11}, {2, 21}]
+t1: select * from test;  -- assert ({1, 12}, {2, 22}) or ({1, 11}, {2, 21})
 t2: commit;              -- assert ok or error
 ```
 
@@ -120,9 +120,5 @@ Anything after a `#` in the assert expression is treated as a free-text
 note and discarded:
 
 ```sql
-t2: select * from test;  -- assert [{1, 11}, {2, 20}] or [{1, 10}, {2, 20}]  # latter under SI
+t2: select * from test;  -- assert ({1, 11}, {2, 20}) or ({1, 10}, {2, 20})  # latter under SI
 ```
-
-Row matching is order-insensitive — engines don't guarantee row order
-without `ORDER BY`, so `[{1, 11}, {2, 20}]` matches a result of either
-`{1, 11}; {2, 20}` or `{2, 20}; {1, 11}`.

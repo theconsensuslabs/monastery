@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"plugin"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -60,16 +61,16 @@ const commentMarker = " -- "
 const assertPrefix = "assert"
 
 // splitOr splits an assert expression on top-level ` or ` separators,
-// ignoring occurrences inside `[...]` or `{...}`.
+// ignoring occurrences inside `(...)` or `{...}`.
 func splitOr(s string) []string {
 	var parts []string
 	depth := 0
 	start := 0
 	for i := 0; i < len(s); {
 		switch s[i] {
-		case '[', '{':
+		case '(', '{':
 			depth++
-		case ']', '}':
+		case ')', '}':
 			depth--
 		}
 		if depth == 0 && i+4 <= len(s) && s[i:i+4] == " or " {
@@ -84,8 +85,9 @@ func splitOr(s string) []string {
 	return parts
 }
 
-// parseAssertAlt parses a single alternative: `error`, `ok`, `[]`, or
-// `[{a, b}, {c, d}, ...]`.
+// parseAssertAlt parses a single alternative: `error`, `ok`, `()`, or
+// `({a, b}, {c, d}, ...)`. The outer parens denote an unordered set of
+// rows; inner braces denote a row tuple.
 func parseAssertAlt(s string) (assertAlt, error) {
 	s = strings.TrimSpace(s)
 	switch s {
@@ -94,8 +96,8 @@ func parseAssertAlt(s string) (assertAlt, error) {
 	case "ok":
 		return assertAlt{kind: assertOK}, nil
 	}
-	if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
-		return assertAlt{}, fmt.Errorf("invalid assert %q: expected `error`, `ok`, or `[{a, b}, ...]`", s)
+	if !strings.HasPrefix(s, "(") || !strings.HasSuffix(s, ")") {
+		return assertAlt{}, fmt.Errorf("invalid assert %q: expected `error`, `ok`, or `({a, b}, ...)`", s)
 	}
 	body := strings.TrimSpace(s[1 : len(s)-1])
 	a := assertAlt{kind: assertRows}
@@ -310,19 +312,58 @@ func (l *logger) close() {
 
 // --- worker -----------------------------------------------------------------
 
+// formatValue renders a single column value into a stable string that
+// doesn't depend on the driver's choice of Go type. Drivers vary in what
+// they hand back for the same logical column (e.g. mysql returns []byte
+// for ints by default, pgx returns int64), so we normalize here.
 func formatValue(v any) string {
-	if b, ok := v.([]byte); ok {
-		return string(b)
+	switch x := v.(type) {
+	case nil:
+		return "NULL"
+	case []byte:
+		return string(x)
+	case string:
+		return x
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case int32:
+		return strconv.FormatInt(int64(x), 10)
+	case int:
+		return strconv.Itoa(x)
+	case uint64:
+		return strconv.FormatUint(x, 10)
+	case float64:
+		return strconv.FormatFloat(x, 'g', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(x), 'g', -1, 32)
+	case time.Time:
+		return x.Format(time.RFC3339Nano)
+	default:
+		return fmt.Sprintf("%v", v)
 	}
-	return fmt.Sprintf("%v", v)
 }
 
-func formatResultRow(row []any) string {
+func formatRow(row []any) string {
 	parts := make([]string, len(row))
 	for i, v := range row {
 		parts[i] = formatValue(v)
 	}
 	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+// formatRows renders the actual result set in the same syntax that
+// `-- assert ...` uses, so RESULTS and ASSERT are visually aligned.
+func formatRows(rows [][]any) string {
+	parts := make([]string, len(rows))
+	for i, r := range rows {
+		parts[i] = formatRow(r)
+	}
+	return "(" + strings.Join(parts, ", ") + ")"
 }
 
 func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, sc *screen, lg *logger, failures *atomic.Int64) {
@@ -346,10 +387,9 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 		})
 
 		var (
-			cols        []string
-			resultParts []string
-			resultRows  [][]any
-			runErr      error
+			cols       []string
+			resultRows [][]any
+			runErr     error
 		)
 
 		rows, err := conn.QueryContext(ctx, s.sql)
@@ -370,7 +410,6 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 					}
 					row := make([]any, len(vals))
 					copy(row, vals)
-					resultParts = append(resultParts, formatResultRow(row))
 					resultRows = append(resultRows, row)
 				}
 			}
@@ -406,7 +445,7 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 			event["columns"] = cols
 			event["rows"] = resultRows
 			event["row_count"] = len(resultRows)
-			row.results = strings.Join(resultParts, "; ")
+			row.results = formatRows(resultRows)
 		}
 		status := evalAssert(s.assert, runErr, resultRows)
 		row.assertStatus = status
