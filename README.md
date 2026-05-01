@@ -149,3 +149,14 @@ t1: commit; -- assert ok; group cycle1
 
 Group checks are skipped when the run is interrupted (Ctrl-C), since a
 missing member would spuriously fail the invariant.
+
+## Per-driver script overrides
+
+Some anomalies surface differently under SI/SSI vs. lock-based
+serializable, and the right assertion depends on the engine. When
+loading `foo.sql`, monastery first looks for `foo.sql.<driver>` (e.g.
+`foo.sql.mysql`) and uses that file if it exists. The actual path
+loaded is recorded in the `session_start` event's `script` field.
+
+`run-hermitage.sh` doesn't need any changes — its `*.sql` glob won't
+match `*.sql.<driver>`, but the Go runner does the resolution.

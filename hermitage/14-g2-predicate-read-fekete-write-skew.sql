@@ -19,4 +19,4 @@ t3: select * from test;
 
 t3: commit;                                         -- group cycle1
 t1: update test set value = 0 where id = 1;         -- group cycle1
-t1: abort;                                          -- group cycle1
+t1: rollback;                                       -- group cycle1

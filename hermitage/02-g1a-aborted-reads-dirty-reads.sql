@@ -11,6 +11,6 @@ t2: $SHOW_ISOLATION;
 
 t1: update test set value = 101 where id = 1;
 t2: select * from test; -- assert ({1, 10}, {2, 20})
-t1: abort;
+t1: rollback;
 t2: select * from test; -- assert ({1, 10}, {2, 20})
 t2: commit;

@@ -686,7 +686,18 @@ func run() error {
 	}
 	showSQL := showIsolationSQLFn()
 
-	f, err := os.Open(scriptPath)
+	// Per-driver overrides: foo.sql.mysql wins over foo.sql when run with
+	// the mysql driver. Lets a test express engine-specific assertions
+	// (e.g. accept the lock-serialized outcome on S2PL, where SI/SSI would
+	// abort) without forking the whole script.
+	resolvedPath := scriptPath
+	if override := scriptPath + "." + driver; !strings.HasSuffix(scriptPath, "."+driver) {
+		if _, statErr := os.Stat(override); statErr == nil {
+			resolvedPath = override
+		}
+	}
+
+	f, err := os.Open(resolvedPath)
 	if err != nil {
 		return fmt.Errorf("open script: %w", err)
 	}
@@ -724,6 +735,7 @@ func run() error {
 		"driver":          driver,
 		"isolation_level": isolationLevel,
 		"interval_ms":     interval.Milliseconds(),
+		"script":          resolvedPath,
 	})
 
 	var sc *screen
