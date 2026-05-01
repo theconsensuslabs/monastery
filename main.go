@@ -300,25 +300,17 @@ func main() {
 }
 
 func run() error {
-	interval := flag.Duration("interval", 0, "delay between dispatching each step (e.g. 500ms, 1s, 1m); enables paced mode when set")
+	interval := flag.Duration("interval", 3*time.Second, "delay between dispatching each step (e.g. 500ms, 1s, 1m)")
 	interactive := flag.Bool("interactive", false, "wait for any keypress before dispatching each step")
 	eventsOnly := flag.Bool("events-only", false, "skip the TUI and stream JSON events to stdout")
 	logPath := flag.String("log", "monastery.jsonl", "path to JSON log file")
 	pluginDir := flag.String("plugin-dir", defaultPluginDir(), "directory containing driver plugin .so files")
 	flag.Parse()
 
-	intervalSet := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "interval" {
-			intervalSet = true
-		}
-	})
-	immediate := !intervalSet && !*interactive
-
 	args := flag.Args()
 	if len(args) < 4 {
 		return errors.New("usage: monastery [-interval <duration>] [-interactive] [-events-only] [-log <path>] <driver> <dsn> <isolation level> <script>\n" +
-			"  -interval duration  delay between steps (e.g. 500ms, 1m); without it, all steps dispatch immediately and the program exits\n" +
+			"  -interval duration  delay between steps (default 3s, e.g. 500ms, 1m)\n" +
 			"  -interactive        wait for keypress before each step instead of using interval\n" +
 			"  -events-only        skip the TUI and stream JSON events to stdout\n" +
 			"  -log path           json log file (default monastery.jsonl)\n" +
@@ -447,9 +439,7 @@ func run() error {
 			<-ctx.Done()
 			sc.s.PostEvent(tcell.NewEventInterrupt(nil))
 		}()
-		if !immediate {
-			go sc.pollEvents(cancel, nextStep)
-		}
+		go sc.pollEvents(cancel, nextStep)
 	}
 
 	if err := runPreconditions(ctx, db, sc, lg, driver, preconditions); err != nil {
@@ -514,10 +504,7 @@ func run() error {
 		}
 	}
 
-	switch {
-	case immediate:
-		dispatch(func() bool { return true })
-	case *interactive:
+	if *interactive {
 		dispatch(func() bool {
 			select {
 			case <-ctx.Done():
@@ -526,7 +513,7 @@ func run() error {
 				return true
 			}
 		})
-	default:
+	} else {
 		ticker := time.NewTicker(*interval)
 		defer ticker.Stop()
 		dispatch(func() bool {
@@ -553,9 +540,9 @@ func run() error {
 	}
 	lg.write(sessionEnd)
 
-	// Skip the post-run pause when there's nothing watching (pipe), when
-	// dispatching immediately, or when shutdown was already triggered.
-	if interrupted || immediate || sc == nil || !isTerminal(os.Stdout) {
+	// Skip the post-run pause when there's no TUI, nothing watching (pipe),
+	// or shutdown was already triggered.
+	if interrupted || sc == nil || !isTerminal(os.Stdout) {
 		return nil
 	}
 	sc.mu.Lock()
