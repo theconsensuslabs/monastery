@@ -187,6 +187,7 @@ come to a view of what we might expect from these isolation levels.
 Jepsen does a good job of talking about the differences between these two classifications. Refer to it authoritatively.
 
 | Isolation Level  | G0 / P0 (Dirty Write) | G1(A/B/C) / P1 (Dirty Read) | P4 Lost Update (NOT TESTED HERE!) | G2-Item / P2 (Fuzzy Read) | G2 / P3 (Phantom) | G-Single / A5A (Read Skew) | G2-Item / A5B (Write Skew) |
+|------------------|-----------------------|-----------------------------|-----------------------------------|---------------------------|-------------------|----------------------------|----------------------------|
 | Read Uncommitted | Not Possible          | Possible                    | Possible                          | Possible                  | Possible          | Possible                   | Possible                   |
 | Read Committed   | Not Possible          | Not Possible                | Possible                          | Possible                  | Possible          | Possible                   | Possible                   |
 | Repeatable Read  | Not Possible          | Not Possible                | Not Possible                      | Not Possible              | Possible          | Not Possible               | Not Possible               |
