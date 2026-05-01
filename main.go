@@ -620,7 +620,32 @@ func sortedKeys(m map[string]bool) []string {
 	return keys
 }
 
+// txnOp classifies a SQL statement as a transaction-control op by
+// prefix-match (case-insensitive). Used to track per-client txn state
+// so the harness can normalize aborted-transaction semantics across
+// engines that disagree (notably MariaDB, which doesn't auto-abort
+// on statement errors at SERIALIZABLE).
+func txnOp(sqlText string) string {
+	s := strings.ToLower(strings.TrimSpace(sqlText))
+	switch {
+	case strings.HasPrefix(s, "begin"), strings.HasPrefix(s, "start transaction"):
+		return "begin"
+	case strings.HasPrefix(s, "commit"):
+		return "commit"
+	case strings.HasPrefix(s, "rollback"):
+		return "rollback"
+	}
+	return ""
+}
+
+// errTxnAborted is returned for statements suppressed while the
+// connection is in the harness-tracked aborted state. Mirrors
+// Postgres's "current transaction is aborted, commands ignored
+// until end of transaction block".
+var errTxnAborted = errors.New("current transaction is aborted, statement ignored")
+
 func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, sc *screen, lg *logger, failures *atomic.Int64, groups *groupTracker) {
+	var inTxn, txnAborted bool
 	for s := range ch {
 		start := time.Now()
 
@@ -640,38 +665,85 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 			assert:  s.assert.raw,
 		})
 
+		op := txnOp(s.sql)
+
 		var (
 			cols       []string
 			resultRows [][]any
 			runErr     error
+			suppressed bool
 		)
 
-		rows, err := conn.QueryContext(ctx, s.sql)
-		if err != nil {
-			runErr = err
+		// Suppress non-BEGIN statements while the txn is in aborted
+		// state. COMMIT/ROLLBACK clear the flag and report success
+		// (we already issued the ROLLBACK when the abort happened).
+		if txnAborted && op != "begin" {
+			suppressed = true
+			if op == "commit" || op == "rollback" {
+				inTxn = false
+				txnAborted = false
+			} else {
+				runErr = errTxnAborted
+			}
 		} else {
-			cols, runErr = rows.Columns()
-			if runErr == nil && len(cols) > 0 {
-				vals := make([]any, len(cols))
-				ptrs := make([]any, len(cols))
-				for i := range vals {
-					ptrs[i] = &vals[i]
-				}
-				for rows.Next() {
-					if err := rows.Scan(ptrs...); err != nil {
-						runErr = err
-						break
-					}
-					row := make([]any, len(vals))
-					copy(row, vals)
-					resultRows = append(resultRows, row)
-				}
-			}
-			if runErr == nil {
-				runErr = rows.Err()
-			}
-			if err := rows.Close(); err != nil && runErr == nil {
+			rows, err := conn.QueryContext(ctx, s.sql)
+			if err != nil {
 				runErr = err
+			} else {
+				cols, runErr = rows.Columns()
+				if runErr == nil && len(cols) > 0 {
+					vals := make([]any, len(cols))
+					ptrs := make([]any, len(cols))
+					for i := range vals {
+						ptrs[i] = &vals[i]
+					}
+					for rows.Next() {
+						if err := rows.Scan(ptrs...); err != nil {
+							runErr = err
+							break
+						}
+						row := make([]any, len(vals))
+						copy(row, vals)
+						resultRows = append(resultRows, row)
+					}
+				}
+				if runErr == nil {
+					runErr = rows.Err()
+				}
+				if err := rows.Close(); err != nil && runErr == nil {
+					runErr = err
+				}
+			}
+
+			switch {
+			case op == "begin" && runErr == nil:
+				inTxn = true
+				txnAborted = false
+			case op == "commit" || op == "rollback":
+				// Txn ends regardless of whether the statement errored.
+				inTxn = false
+				txnAborted = false
+			case runErr != nil && inTxn:
+				// Engine-agnostic normalization: on any statement
+				// error inside a txn, issue ROLLBACK and mark the
+				// connection aborted so subsequent statements
+				// short-circuit. Postgres already does this internally;
+				// MySQL/MariaDB don't, so without this an errored
+				// statement can leave the txn alive and produce torn
+				// commits (e.g. MariaDB error 1020 at SERIALIZABLE).
+				_, rbErr := conn.ExecContext(ctx, "ROLLBACK")
+				inTxn = false
+				txnAborted = true
+				autoEvent := map[string]any{
+					"event":   "auto_rollback",
+					"client":  id,
+					"trigger": s.sql,
+					"time":    time.Now().Format(time.RFC3339Nano),
+				}
+				if rbErr != nil {
+					autoEvent["rollback_error"] = rbErr.Error()
+				}
+				lg.write(autoEvent)
 			}
 		}
 
@@ -691,6 +763,9 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 			start:   start.Format("15:04:05.000"),
 			end:     end.Format("15:04:05.000"),
 			assert:  s.assert.raw,
+		}
+		if suppressed {
+			event["suppressed"] = true
 		}
 		if runErr != nil {
 			event["error"] = runErr.Error()
