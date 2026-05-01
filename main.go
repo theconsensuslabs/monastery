@@ -133,7 +133,7 @@ const (
 	numCols
 )
 
-var colWidths = [numCols]int{
+var colDefaultWidths = [numCols]int{
 	10, // client
 	60, // command
 	14, // start
@@ -143,19 +143,84 @@ var colWidths = [numCols]int{
 	50, // notes
 }
 
+// Minimum widths preserve readability of fixed-format fields
+// (timestamps need 12 for HH:MM:SS.mmm) while letting wide free-text
+// columns shrink down further.
+var colMinWidths = [numCols]int{
+	4,  // client
+	10, // command
+	12, // start
+	12, // end
+	8,  // results
+	10, // error
+	10, // notes
+}
+
+var colWidths = colDefaultWidths
+var colOffsets [numCols]int
+
 var colHeaders = [numCols]string{
 	"CLIENT", "COMMAND", "STARTED", "ENDED", "RESULTS", "ERROR", "NOTES",
 }
 
-var colOffsets = func() [numCols]int {
-	var off [numCols]int
+func init() {
+	recomputeColOffsets()
+}
+
+func recomputeColOffsets() {
 	x := 1
 	for i, w := range colWidths {
-		off[i] = x
+		colOffsets[i] = x
 		x += w + 1
 	}
-	return off
-}()
+}
+
+// recomputeColWidths fits the column layout to the current screen width.
+// numCols+1 cells go to borders/separators; the rest is split among columns,
+// preferring defaults when there's room and otherwise distributing the
+// available space above each column's minimum proportionally to its slack.
+func recomputeColWidths(screenW int) {
+	overhead := numCols + 1
+	sumDefault := 0
+	for _, d := range colDefaultWidths {
+		sumDefault += d
+	}
+	if screenW >= sumDefault+overhead {
+		colWidths = colDefaultWidths
+		recomputeColOffsets()
+		return
+	}
+	sumMin := 0
+	for _, m := range colMinWidths {
+		sumMin += m
+	}
+	avail := screenW - overhead
+	if avail <= sumMin {
+		// even minimums don't fit — scale them proportionally, never below 1
+		for i, m := range colMinWidths {
+			w := 1
+			if avail > 0 {
+				w = m * avail / sumMin
+				if w < 1 {
+					w = 1
+				}
+			}
+			colWidths[i] = w
+		}
+		recomputeColOffsets()
+		return
+	}
+	extra := avail - sumMin
+	slack := sumDefault - sumMin
+	distributed := 0
+	for i := 0; i < numCols-1; i++ {
+		add := (colDefaultWidths[i] - colMinWidths[i]) * extra / slack
+		colWidths[i] = colMinWidths[i] + add
+		distributed += add
+	}
+	colWidths[numCols-1] = colMinWidths[numCols-1] + (extra - distributed)
+	recomputeColOffsets()
+}
 
 func totalWidth() int {
 	w := 1
@@ -264,6 +329,8 @@ func newScreen() (*screen, error) {
 	}
 	s.Clear()
 	sc := &screen{s: s}
+	w, _ := s.Size()
+	recomputeColWidths(w)
 	sc.drawHeader()
 	return sc, nil
 }
@@ -459,9 +526,10 @@ func (sc *screen) drawHeader() {
 const headerLines = 3
 
 func (sc *screen) redrawAll() {
+	w, h := sc.s.Size()
+	recomputeColWidths(w)
 	sc.s.Clear()
 	sc.drawHeader()
-	w, h := sc.s.Size()
 	total := sc.totalContentLines()
 	contentTop, contentBottom, visible := contentBounds(h, total, sc.dumping)
 
