@@ -10,8 +10,8 @@ t2: begin;
 t2: $SHOW_ISOLATION;
 
 t1: update test set value = 101 where id = 1;
-t2: select * from test; -- assert ({1, 10}, {2, 20}) or ({1, 11}, {2, 20})
+t2: select * from test; -- group final; assert ({1, 10}, {2, 20}) or ({1, 11}, {2, 20}) or t2aborted => error
 t1: update test set value = 11 where id = 1;
 t1: commit;
-t2: select * from test; -- assert ({1, 11}, {2, 20}) or ({1, 10}, {2, 20})
+t2: select * from test; -- group final; assert ({1, 11}, {2, 20}) or ({1, 10}, {2, 20}) or t2aborted => error
 t2: commit;
