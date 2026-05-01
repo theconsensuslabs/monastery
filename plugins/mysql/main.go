@@ -16,7 +16,7 @@ func IsolationSQL(level string) string {
 	if !ok {
 		return ""
 	}
-	return "SET TRANSACTION ISOLATION LEVEL " + l
+	return "SET SESSION TRANSACTION ISOLATION LEVEL " + l
 }
 
 func ShowIsolationSQL() string {
