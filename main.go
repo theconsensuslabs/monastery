@@ -300,7 +300,7 @@ func main() {
 }
 
 func run() error {
-	interval := flag.Duration("interval", 3*time.Second, "delay between dispatching each step (e.g. 500ms, 1s, 1m)")
+	interval := flag.Duration("interval", 300*time.Millisecond, "delay between dispatching each step (e.g. 500ms, 1s, 1m)")
 	interactive := flag.Bool("interactive", false, "wait for any keypress before dispatching each step")
 	eventsOnly := flag.Bool("events-only", false, "skip the TUI and stream JSON events to stdout")
 	logPath := flag.String("log", "monastery.jsonl", "path to JSON log file")
