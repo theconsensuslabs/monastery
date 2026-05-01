@@ -194,7 +194,12 @@ Ignore the failing column for Read Uncommitted. Postgres does not have this isol
 ```shell
 $ psql --version
 psql (PostgreSQL) 18.3 (Ubuntu 18.3-1.pgdg24.04+1)
+
 $ ./run-hermitage.sh postgres "dbname=postgres host=/var/run/postgresql"
+```
+
+Produces:
+
 | Test                                         | Read Uncommitted   | Read Committed     | Repeatable Read    | Serializable       |
 |----------------------------------------------|--------------------|--------------------|--------------------|--------------------|
 | 01-g0-write-cycles-dirty-writes              | FAIL               | OK                 | OK                 | OK                 |
@@ -211,7 +216,6 @@ $ ./run-hermitage.sh postgres "dbname=postgres host=/var/run/postgresql"
 | 12-g2-item-write-skew                        | FAIL               | FAIL               | FAIL               | OK                 |
 | 13-g2-predicate-read-write-skew              | FAIL               | FAIL               | FAIL               | OK                 |
 | 14-g2-predicate-read-fekete-write-skew       | FAIL               | FAIL               | FAIL               | OK                 |
-```
 
 ### MySQL
 
@@ -220,6 +224,10 @@ $ mysql --version
 mysql  Ver 9.7.0 for Linux on x86_64 (MySQL Community Server - GPL)
 
 $ ./run-hermitage.sh mysql 'root@tcp(localhost)/test'
+```
+
+Produces:
+
 | Test                                         | Read Uncommitted   | Read Committed     | Repeatable Read    | Serializable       |
 |----------------------------------------------|--------------------|--------------------|--------------------|--------------------|
 | 01-g0-write-cycles-dirty-writes              | FAIL               | OK                 | OK                 | OK                 |
@@ -236,7 +244,6 @@ $ ./run-hermitage.sh mysql 'root@tcp(localhost)/test'
 | 12-g2-item-write-skew                        | FAIL               | FAIL               | FAIL               | OK                 |
 | 13-g2-predicate-read-write-skew              | FAIL               | FAIL               | FAIL               | OK                 |
 | 14-g2-predicate-read-fekete-write-skew       | FAIL               | FAIL               | FAIL               | OK                 |
-```
 
 ### MariaDB
 
@@ -245,6 +252,10 @@ $ mariadb --version
 mariadb from 11.8.6-MariaDB, client 15.2 for debian-linux-gnu (x86_64) using  EditLine wrapper
 
 $ ./run-hermitage.sh mysql 'root:root@tcp(localhost)/test'
+```
+
+Produces:
+
 | Test                                         | Read Uncommitted   | Read Committed     | Repeatable Read    | Serializable       |
 |----------------------------------------------|--------------------|--------------------|--------------------|--------------------|
 | 01-g0-write-cycles-dirty-writes              | FAIL               | OK                 | OK                 | OK                 |
@@ -261,4 +272,22 @@ $ ./run-hermitage.sh mysql 'root:root@tcp(localhost)/test'
 | 12-g2-item-write-skew                        | FAIL               | FAIL               | FAIL               | OK                 |
 | 13-g2-predicate-read-write-skew              | FAIL               | FAIL               | FAIL               | OK                 |
 | 14-g2-predicate-read-fekete-write-skew       | FAIL               | FAIL               | FAIL               | OK                 |
-```
+
+
+## Expected behavior
+
+This is a very fuzzy matchup of [A Critique of ANSI SQL Isolation
+Levels](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr-95-51.pdf)
+and [Weak Consistency: A Generalized Theory and Optimistic
+Implementations for Distributed
+Transactions](https://publications.csail.mit.edu/lcs/pubs/pdf/MIT-LCS-TR-786.pdf)
+and [Jepsen](https://jepsen.io/consistency/models) to very fuzzily
+come to a view of what we might expect from these isolation levels.
+
+Jepsen does a good job of talking about the differences between these two classifications. Refer to it authoritatively.
+
+| Isolation Level  | G0 / P0 (Dirty Write) | G1(A/B/C) / P1 (Dirty Read) | P4 Lost Update (NOT TESTED HERE!) | G2-Item / P2 (Fuzzy Read) | G2 / P3 (Phantom) | G-Single / A5A (Read Skew) | G2-Item / A5B (Write Skew) |
+| Read Uncommitted | Not Possible          | Possible                    | Possible                          | Possible                  | Possible          | Possible                   | Possible                   |
+| Read Committed   | Not Possible          | Not Possible                | Possible                          | Possible                  | Possible          | Possible                   | Possible                   |
+| Repeatable Read  | Not Possible          | Not Possible                | Not Possible                      | Not Possible              | Possible          | Not Possible               | Not Possible               |
+| Serializable     | Not Possible          | Not Possible                | Not Possible                      | Not Possible              | Not Possible      | Not Possible               | Not Possible               |
