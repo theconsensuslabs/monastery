@@ -125,21 +125,54 @@ t2: select * from test;  -- assert ({1, 11}, {2, 20}) or ({1, 10}, {2, 20})  # l
 
 ## Group invariants
 
+Tag related steps with `-- group <name>` and monastery emits a
+synthetic check row after the run. There are two modes, picked
+automatically:
+
+### Error mode (no labeled assertions in the group)
+
 Per-step assertions hard-code which transaction the engine must abort.
 That works for SSI (deterministic victim by commit order) but breaks on
 S2PL implementations that resolve cycles via deadlock detection and may
 pick a different victim. To assert "*some* transaction in this cycle
-must abort, but I don't care which", tag each candidate step with
-`-- group <name>`:
+must abort, but I don't care which", tag each candidate step:
 
 ```sql
 t1: update test set value = 0 where id = 1;          -- group cycle1
 t2: update test set value = value + 5 where id = 2;  -- group cycle1
 ```
 
-After the run, each named group is checked: at least one tagged step
-must have errored. The result appears as a synthetic row in the table
-(`group: at least one error`) and is logged as a `group_eval` event.
+The check passes when at least one tagged step errored. The synthetic
+row reads `group: at least one error`.
+
+### Schedule mode (labeled `=>` branches)
+
+When the same hidden serial order should govern several reads, label
+each `or` branch with a short identifier and tag the reads with the
+same group:
+
+```sql
+t1: update test set value = 11 where id = 1;
+t2: update test set value = 12 where id = 1;
+t1: commit;
+t1: select * from test; -- group final; assert t2committed => ({1, 12}, {2, 22}) or t2aborted => ({1, 11}, {2, 21})
+t2: select * from test; -- group final; assert t2committed => ({1, 12}, {2, 22}) or t2aborted => ({1, 11}, {2, 21})
+```
+
+Each branch carries an arbitrary label naming a serial-equivalence
+class. Per-step status passes if any branch matches (same as today's
+`or`). The group additionally requires a single label to be feasible
+across all members — i.e., every member's matched branch set agrees on
+some L. Mixed outcomes (e.g. one read sees `t2committed`, the other
+sees `t2aborted`) fail the group as `no consistent schedule`.
+
+Unlabeled `or` branches act as wildcards for the group check. Members
+without an `assert` directive (e.g. `commit;`) are unconstrained. Pick
+the mode that fits the invariant: schedule mode catches torn views
+across multiple reads; error mode is for non-deterministic abort
+victims.
+
+### Composing
 
 `group` and `assert` are composable, separated by `;`:
 

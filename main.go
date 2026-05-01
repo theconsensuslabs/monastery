@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"plugin"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,14 +41,19 @@ const (
 )
 
 type assertAlt struct {
-	kind assertKind
-	rows [][]string
+	kind  assertKind
+	rows  [][]string
+	label string // schedule label, empty = unlabeled (wildcard for group consistency)
 }
 
 type assertion struct {
 	alts []assertAlt
 	raw  string
 }
+
+// wildcardLabel is the synthetic label for unlabeled branches: matched
+// unlabeled branches are compatible with any schedule.
+const wildcardLabel = "*"
 
 type step struct {
 	clientID string
@@ -87,22 +93,52 @@ func splitOr(s string) []string {
 	return parts
 }
 
+// isAssertLabel returns true for a simple identifier (letters, digits,
+// underscore; first char non-digit). Labels guard the `=>` form so SQL-ish
+// expressions don't get misread as labels.
+func isAssertLabel(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		isAlpha := r == '_' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		isDigit := r >= '0' && r <= '9'
+		if i == 0 && !isAlpha {
+			return false
+		}
+		if !isAlpha && !isDigit {
+			return false
+		}
+	}
+	return true
+}
+
 // parseAssertAlt parses a single alternative: `error`, `ok`, `()`, or
-// `({a, b}, {c, d}, ...)`. The outer parens denote an unordered set of
-// rows; inner braces denote a row tuple.
+// `({a, b}, {c, d}, ...)`, optionally prefixed with `<label> => `. The
+// outer parens denote an unordered set of rows; inner braces denote a row
+// tuple. Labels are used to enforce per-schedule consistency across the
+// members of a group (see evalScheduleGroup).
 func parseAssertAlt(s string) (assertAlt, error) {
 	s = strings.TrimSpace(s)
+	var label string
+	if idx := strings.Index(s, "=>"); idx != -1 {
+		cand := strings.TrimSpace(s[:idx])
+		if isAssertLabel(cand) {
+			label = cand
+			s = strings.TrimSpace(s[idx+2:])
+		}
+	}
 	switch s {
 	case "error":
-		return assertAlt{kind: assertError}, nil
+		return assertAlt{kind: assertError, label: label}, nil
 	case "ok":
-		return assertAlt{kind: assertOK}, nil
+		return assertAlt{kind: assertOK, label: label}, nil
 	}
 	if !strings.HasPrefix(s, "(") || !strings.HasSuffix(s, ")") {
 		return assertAlt{}, fmt.Errorf("invalid assert %q: expected `error`, `ok`, or `({a, b}, ...)`", s)
 	}
 	body := strings.TrimSpace(s[1 : len(s)-1])
-	a := assertAlt{kind: assertRows}
+	a := assertAlt{kind: assertRows, label: label}
 	for i := 0; i < len(body); {
 		for i < len(body) && (body[i] == ' ' || body[i] == ',' || body[i] == '\t') {
 			i++
@@ -286,18 +322,30 @@ func rowEqual(got []any, want []string) bool {
 	return true
 }
 
-// evalAssert returns "OK", "FAIL", or "" for no assertion. With multiple
-// alternatives, the assertion holds if any matches.
-func evalAssert(a assertion, runErr error, rows [][]any) string {
+// evalAssert returns "OK", "FAIL", or "" for no assertion, plus the set of
+// labels whose branches matched. The wildcard label "*" is added when an
+// unlabeled branch matched. The label set drives schedule-group consistency
+// checks (see evalScheduleGroup); it is nil when there is no assertion or
+// when no branch matched.
+func evalAssert(a assertion, runErr error, rows [][]any) (string, map[string]bool) {
 	if len(a.alts) == 0 {
-		return ""
+		return "", nil
 	}
+	matched := map[string]bool{}
 	for _, alt := range a.alts {
-		if evalAssertAlt(alt, runErr, rows) {
-			return "OK"
+		if !evalAssertAlt(alt, runErr, rows) {
+			continue
+		}
+		if alt.label == "" {
+			matched[wildcardLabel] = true
+		} else {
+			matched[alt.label] = true
 		}
 	}
-	return "FAIL"
+	if len(matched) == 0 {
+		return "FAIL", nil
+	}
+	return "OK", matched
 }
 
 // --- logger -----------------------------------------------------------------
@@ -390,32 +438,40 @@ func formatRows(rows [][]any) string {
 	return "(" + strings.Join(parts, ", ") + ")"
 }
 
-// groupTracker collects per-step error outcomes for steps tagged with
+// groupTracker collects per-step outcomes for steps tagged with
 // `-- group <name>`. After all workers exit, evalGroups walks each named
-// group and asserts that at least one member errored — the cycle-victim
-// invariant for engines where the choice of victim is non-deterministic.
+// group in one of two modes:
+//   - error mode (no member has any assertion): at least one member must
+//     have errored — the cycle-victim invariant for engines where the
+//     choice of victim is non-deterministic.
+//   - schedule mode (at least one member has a labeled assertion branch):
+//     there must exist some label L that every asserting member is
+//     compatible with — i.e., the members' results agree on a single
+//     serial schedule. See evalScheduleGroup.
 type groupTracker struct {
 	mu      sync.Mutex
 	members map[string][]groupMember
 }
 
 type groupMember struct {
-	client  string
-	sql     string
-	errored bool
+	client    string
+	sql       string
+	errored   bool
+	hasAssert bool
+	matched   map[string]bool // labels (and "*") whose branches matched
 }
 
 func newGroupTracker() *groupTracker {
 	return &groupTracker{members: map[string][]groupMember{}}
 }
 
-func (g *groupTracker) record(group, client, sql string, errored bool) {
+func (g *groupTracker) record(group, client, sql string, errored, hasAssert bool, matched map[string]bool) {
 	if group == "" {
 		return
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.members[group] = append(g.members[group], groupMember{client, sql, errored})
+	g.members[group] = append(g.members[group], groupMember{client, sql, errored, hasAssert, matched})
 }
 
 // groupOrder returns the unique group names in the order they first appear
@@ -432,42 +488,136 @@ func groupOrder(steps []step) []string {
 	return order
 }
 
+// groupLabels returns the set of distinct schedule labels declared across
+// all asserts in members of the named group. Drives schedule-mode dispatch
+// (any labels present → schedule mode) and the universe used when
+// computing label feasibility.
+func groupLabels(steps []step, name string) map[string]bool {
+	labels := map[string]bool{}
+	for _, s := range steps {
+		if s.group != name {
+			continue
+		}
+		for _, alt := range s.assert.alts {
+			if alt.label != "" {
+				labels[alt.label] = true
+			}
+		}
+	}
+	return labels
+}
+
 // evalGroups walks each named group and emits an OK/FAIL row for the
-// "at least one member errored" invariant. Synthetic rows are appended
+// invariant appropriate to the group's mode. Synthetic rows are appended
 // to the display so the dump captures them.
 func evalGroups(steps []step, tracker *groupTracker, sc *screen, lg *logger, failures *atomic.Int64) {
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
 	for _, name := range groupOrder(steps) {
 		members := tracker.members[name]
-		errored := 0
-		for _, m := range members {
-			if m.errored {
-				errored++
-			}
-		}
-		status := "OK"
-		if errored == 0 {
-			status = "FAIL"
-			failures.Add(1)
-		}
-		summary := fmt.Sprintf("%d/%d errored", errored, len(members))
-		lg.write(map[string]any{
-			"event":         "group_eval",
-			"group":         name,
-			"members":       len(members),
-			"errored":       errored,
-			"assert_status": status,
-		})
-		if sc != nil {
-			sc.addRow(rowData{
-				client:       name,
-				command:      summary,
-				assert:       "group: at least one error",
-				assertStatus: status,
-			})
+		labels := groupLabels(steps, name)
+		if len(labels) > 0 {
+			evalScheduleGroup(name, members, labels, sc, lg, failures)
+		} else {
+			evalErrorGroup(name, members, sc, lg, failures)
 		}
 	}
+}
+
+func evalErrorGroup(name string, members []groupMember, sc *screen, lg *logger, failures *atomic.Int64) {
+	errored := 0
+	for _, m := range members {
+		if m.errored {
+			errored++
+		}
+	}
+	status := "OK"
+	if errored == 0 {
+		status = "FAIL"
+		failures.Add(1)
+	}
+	summary := fmt.Sprintf("%d/%d errored", errored, len(members))
+	lg.write(map[string]any{
+		"event":         "group_eval",
+		"group":         name,
+		"mode":          "error",
+		"members":       len(members),
+		"errored":       errored,
+		"assert_status": status,
+	})
+	if sc != nil {
+		sc.addRow(rowData{
+			client:       name,
+			command:      summary,
+			assert:       "group: at least one error",
+			assertStatus: status,
+		})
+	}
+}
+
+// evalScheduleGroup checks that the members' results are consistent with a
+// single serial schedule: there must exist some label L in the universe
+// such that every asserting member is compatible with L. A member is
+// compatible with L when its matched-label set contains L or the wildcard
+// (an unlabeled branch matched). Members without assertions are
+// unconstrained.
+func evalScheduleGroup(name string, members []groupMember, universe map[string]bool, sc *screen, lg *logger, failures *atomic.Int64) {
+	feasible := map[string]bool{}
+	for L := range universe {
+		feasible[L] = true
+	}
+	for _, m := range members {
+		if !m.hasAssert {
+			continue
+		}
+		if m.matched[wildcardLabel] {
+			continue
+		}
+		for L := range feasible {
+			if !m.matched[L] {
+				delete(feasible, L)
+			}
+		}
+	}
+	status := "OK"
+	if len(feasible) == 0 {
+		status = "FAIL"
+		failures.Add(1)
+	}
+	feasibleList := sortedKeys(feasible)
+	universeList := sortedKeys(universe)
+	var summary string
+	if len(feasibleList) == 0 {
+		summary = "no consistent schedule"
+	} else {
+		summary = "schedule: {" + strings.Join(feasibleList, ", ") + "}"
+	}
+	lg.write(map[string]any{
+		"event":         "group_eval",
+		"group":         name,
+		"mode":          "schedule",
+		"members":       len(members),
+		"universe":      universeList,
+		"feasible":      feasibleList,
+		"assert_status": status,
+	})
+	if sc != nil {
+		sc.addRow(rowData{
+			client:       name,
+			command:      summary,
+			assert:       "group: consistent schedule across {" + strings.Join(universeList, ", ") + "}",
+			assertStatus: status,
+		})
+	}
+}
+
+func sortedKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, sc *screen, lg *logger, failures *atomic.Int64, groups *groupTracker) {
@@ -551,7 +701,7 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 			event["row_count"] = len(resultRows)
 			row.results = formatRows(resultRows)
 		}
-		status := evalAssert(s.assert, runErr, resultRows)
+		status, matched := evalAssert(s.assert, runErr, resultRows)
 		row.assertStatus = status
 		if status != "" {
 			event["assert_status"] = status
@@ -559,7 +709,7 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 				failures.Add(1)
 			}
 		}
-		groups.record(s.group, id, s.sql, runErr != nil)
+		groups.record(s.group, id, s.sql, runErr != nil, len(s.assert.alts) > 0, matched)
 		lg.write(event)
 		sc.updateRow(idx, row)
 	}

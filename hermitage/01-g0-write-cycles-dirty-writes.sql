@@ -16,5 +16,5 @@ t1: commit;
 t1: select * from test; -- assert ({1, 11}, {2, 21})
 t2: update test set value = 22 where id = 2;
 t2: commit;
-t1: select * from test; -- assert ({1, 12}, {2, 22}) or ({1, 11}, {2, 21})
-t2: select * from test; -- assert ({1, 12}, {2, 22}) or ({1, 11}, {2, 21})
+t1: select * from test; -- group final; assert t2committed => ({1, 12}, {2, 22}) or t2aborted => ({1, 11}, {2, 21})
+t2: select * from test; -- group final; assert t2committed => ({1, 12}, {2, 22}) or t2aborted => ({1, 11}, {2, 21})
