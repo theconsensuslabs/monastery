@@ -189,10 +189,12 @@ match `*.sql.<driver>`, but the Go runner does the resolution.
 
 ### Postgres
 
+Ignore the failing column for Read Uncommitted. Postgres does not have this isolation level.
+
 ```shell
-$ postgres --version
-postgres (PostgreSQL) 18.1 (Homebrew)
-$ ./run-hermitage.sh postgres 'host=localhost port=4000 sslmode=disable dbname=postgres'
+$ psql --version
+psql (PostgreSQL) 18.3 (Ubuntu 18.3-1.pgdg24.04+1)
+$ ./run-hermitage.sh postgres "dbname=postgres host=/var/run/postgresql"
 | Test                                         | Read Uncommitted   | Read Committed     | Repeatable Read    | Serializable       |
 |----------------------------------------------|--------------------|--------------------|--------------------|--------------------|
 | 01-g0-write-cycles-dirty-writes              | FAIL               | OK                 | OK                 | OK                 |
@@ -213,10 +215,11 @@ $ ./run-hermitage.sh postgres 'host=localhost port=4000 sslmode=disable dbname=p
 
 ### MySQL
 
-```
+```shell
 $ mysql --version
-mysql  Ver 9.6.0 for macos15.7 on arm64 (Homebrew)
-$ ./run-hermitage.sh mysql "root@tcp(127.0.0.1:3306)/testdb"
+mysql  Ver 9.7.0 for Linux on x86_64 (MySQL Community Server - GPL)
+
+$ ./run-hermitage.sh mysql 'root@tcp(localhost)/test'
 | Test                                         | Read Uncommitted   | Read Committed     | Repeatable Read    | Serializable       |
 |----------------------------------------------|--------------------|--------------------|--------------------|--------------------|
 | 01-g0-write-cycles-dirty-writes              | FAIL               | OK                 | OK                 | OK                 |
@@ -229,6 +232,31 @@ $ ./run-hermitage.sh mysql "root@tcp(127.0.0.1:3306)/testdb"
 | 08-p4-lost-update                            | FAIL               | FAIL               | FAIL               | OK                 |
 | 09-g-single-read-skew                        | FAIL               | FAIL               | OK                 | OK                 |
 | 10-g-single-write-predicate                  | FAIL               | FAIL               | FAIL               | OK                 |
+| 11-g-single-predicate-read-skew              | FAIL               | FAIL               | OK                 | OK                 |
+| 12-g2-item-write-skew                        | FAIL               | FAIL               | FAIL               | OK                 |
+| 13-g2-predicate-read-write-skew              | FAIL               | FAIL               | FAIL               | OK                 |
+| 14-g2-predicate-read-fekete-write-skew       | FAIL               | FAIL               | FAIL               | OK                 |
+```
+
+### MariaDB
+
+```shell
+$ mariadb --version
+mariadb from 11.8.6-MariaDB, client 15.2 for debian-linux-gnu (x86_64) using  EditLine wrapper
+
+$ ./run-hermitage.sh mysql 'root:root@tcp(localhost)/test'
+| Test                                         | Read Uncommitted   | Read Committed     | Repeatable Read    | Serializable       |
+|----------------------------------------------|--------------------|--------------------|--------------------|--------------------|
+| 01-g0-write-cycles-dirty-writes              | FAIL               | OK                 | OK                 | OK                 |
+| 02-g1a-aborted-reads-dirty-reads             | FAIL               | OK                 | OK                 | OK                 |
+| 03-g1b-intermediate-reads-dirty-reads        | FAIL               | OK                 | OK                 | OK                 |
+| 04-g1c-circular-information-flow-dirty-reads | FAIL               | OK                 | OK                 | OK                 |
+| 05-otv                                       | OK                 | OK                 | OK                 | OK                 |
+| 06-pmp                                       | FAIL               | FAIL               | OK                 | OK                 |
+| 07-pmp-write-predicates                      | OK                 | OK                 | OK                 | OK                 |
+| 08-p4-lost-update                            | FAIL               | FAIL               | OK                 | OK                 |
+| 09-g-single-read-skew                        | FAIL               | FAIL               | OK                 | OK                 |
+| 10-g-single-write-predicate                  | FAIL               | FAIL               | OK                 | OK                 |
 | 11-g-single-predicate-read-skew              | FAIL               | FAIL               | OK                 | OK                 |
 | 12-g2-item-write-skew                        | FAIL               | FAIL               | FAIL               | OK                 |
 | 13-g2-predicate-read-write-skew              | FAIL               | FAIL               | FAIL               | OK                 |
