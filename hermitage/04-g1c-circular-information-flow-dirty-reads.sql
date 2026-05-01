@@ -11,7 +11,7 @@ t2: $SHOW_ISOLATION;
 
 t1: update test set value = 11 where id = 1;
 t2: update test set value = 22 where id = 2;
-t1: select * from test where id = 2; -- Read-committed+ should still show 2 => 20.
-t2: select * from test where id = 1; -- Read-committed+ should still show 1 => 10.
+t1: select * from test where id = 2; -- assert [{2, 20}]
+t2: select * from test where id = 1; -- assert [{1, 10}]
 t1: commit;
-t1: commit;
+t2: commit;

@@ -18,7 +18,7 @@ const (
 	colEnd
 	colResults
 	colError
-	colNotes
+	colAssert
 	numCols
 )
 
@@ -29,7 +29,7 @@ var colDefaultWidths = [numCols]int{
 	14, // end
 	20, // results
 	40, // error
-	50, // notes
+	50, // assert
 }
 
 // Minimum widths preserve readability of fixed-format fields
@@ -42,14 +42,14 @@ var colMinWidths = [numCols]int{
 	12, // end
 	8,  // results
 	10, // error
-	10, // notes
+	10, // assert
 }
 
 var colWidths = colDefaultWidths
 var colOffsets [numCols]int
 
 var colHeaders = [numCols]string{
-	"CLIENT", "COMMAND", "STARTED", "ENDED", "RESULTS", "ERROR", "NOTES",
+	"CLIENT", "COMMAND", "STARTED", "ENDED", "RESULTS", "ERROR", "ASSERT",
 }
 
 func init() {
@@ -152,9 +152,19 @@ func wrapText(text string, width int) []string {
 	return lines
 }
 
+func formatAssertCell(r rowData) string {
+	if r.assert == "" {
+		return ""
+	}
+	if r.assertStatus == "" {
+		return r.assert
+	}
+	return r.assertStatus + " " + r.assert
+}
+
 func rowLines(r rowData) ([numCols][]string, int) {
 	fields := [numCols]string{
-		r.client, r.command, r.start, r.end, r.results, r.err, r.notes,
+		r.client, r.command, r.start, r.end, r.results, r.err, formatAssertCell(r),
 	}
 	var wrapped [numCols][]string
 	maxLines := 1
@@ -170,13 +180,14 @@ func rowLines(r rowData) ([numCols][]string, int) {
 // --- screen -----------------------------------------------------------------
 
 type rowData struct {
-	client  string
-	command string
-	start   string
-	end     string
-	results string
-	err     string
-	notes   string
+	client       string
+	command      string
+	start        string
+	end          string
+	results      string
+	err          string
+	assert       string
+	assertStatus string
 }
 
 type screen struct {
@@ -354,6 +365,7 @@ func (sc *screen) drawLogicalRow(y int, r rowData, firstLine int) int {
 	defaultStyle := tcell.StyleDefault
 	pendingStyle := tcell.StyleDefault.Foreground(tcell.ColorYellow)
 	errorStyle := tcell.StyleDefault.Foreground(tcell.ColorRed)
+	passStyle := tcell.StyleDefault.Foreground(tcell.ColorGreen)
 
 	endStyle := defaultStyle
 	if r.end == "pending" {
@@ -363,9 +375,16 @@ func (sc *screen) drawLogicalRow(y int, r rowData, firstLine int) int {
 	if r.err != "" {
 		errStyle = errorStyle
 	}
+	assertStyle := defaultStyle
+	switch r.assertStatus {
+	case "OK":
+		assertStyle = passStyle
+	case "FAIL":
+		assertStyle = errorStyle
+	}
 	styles := [numCols]tcell.Style{
 		defaultStyle, defaultStyle, defaultStyle,
-		endStyle, defaultStyle, errStyle, defaultStyle,
+		endStyle, defaultStyle, errStyle, assertStyle,
 	}
 
 	wrapped, numLines := rowLines(r)

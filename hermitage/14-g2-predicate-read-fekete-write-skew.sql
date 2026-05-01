@@ -18,5 +18,5 @@ t3: $SHOW_ISOLATION
 t3: select * from test;
 
 t3: commit;
-t1: update test set value = 0 where id = 1; -- Should fail on serializable.
+t1: update test set value = 0 where id = 1; -- assert error
 t1: abort;

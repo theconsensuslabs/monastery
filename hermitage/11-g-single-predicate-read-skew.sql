@@ -13,5 +13,5 @@ t1: select * from test where value % 5 = 0;
 t2: update test set value = 12 where value = 10;
 t2: commit;
 
-t1: select * from test where value % 3 = 0; -- Should return nothing on repeatable-read+.
+t1: select * from test where value % 3 = 0; -- assert []
 t1: commit;

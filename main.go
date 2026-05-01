@@ -9,13 +9,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"plugin"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,31 +30,151 @@ func newUUID() string {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
+type assertKind int
+
+const (
+	assertError assertKind = iota
+	assertOK
+	assertRows
+)
+
+type assertAlt struct {
+	kind assertKind
+	rows [][]string
+}
+
+type assertion struct {
+	alts []assertAlt
+	raw  string
+}
+
 type step struct {
 	clientID string
 	sql      string
-	notes    string
+	assert   assertion
 }
 
-// notesMarker requires surrounding whitespace so it doesn't collide with
+// commentMarker requires surrounding whitespace so it doesn't collide with
 // `--` appearing inside SQL literals or identifiers.
-const notesMarker = " -- "
+const commentMarker = " -- "
+const assertPrefix = "assert"
 
-func parseStep(line string) (step, bool) {
-	var notes string
-	if idx := strings.Index(line, notesMarker); idx != -1 {
-		notes = strings.TrimSpace(line[idx+len(notesMarker):])
+// splitOr splits an assert expression on top-level ` or ` separators,
+// ignoring occurrences inside `[...]` or `{...}`.
+func splitOr(s string) []string {
+	var parts []string
+	depth := 0
+	start := 0
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case '[', '{':
+			depth++
+		case ']', '}':
+			depth--
+		}
+		if depth == 0 && i+4 <= len(s) && s[i:i+4] == " or " {
+			parts = append(parts, strings.TrimSpace(s[start:i]))
+			i += 4
+			start = i
+			continue
+		}
+		i++
+	}
+	parts = append(parts, strings.TrimSpace(s[start:]))
+	return parts
+}
+
+// parseAssertAlt parses a single alternative: `error`, `ok`, `[]`, or
+// `[{a, b}, {c, d}, ...]`.
+func parseAssertAlt(s string) (assertAlt, error) {
+	s = strings.TrimSpace(s)
+	switch s {
+	case "error":
+		return assertAlt{kind: assertError}, nil
+	case "ok":
+		return assertAlt{kind: assertOK}, nil
+	}
+	if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
+		return assertAlt{}, fmt.Errorf("invalid assert %q: expected `error`, `ok`, or `[{a, b}, ...]`", s)
+	}
+	body := strings.TrimSpace(s[1 : len(s)-1])
+	a := assertAlt{kind: assertRows}
+	for i := 0; i < len(body); {
+		for i < len(body) && (body[i] == ' ' || body[i] == ',' || body[i] == '\t') {
+			i++
+		}
+		if i >= len(body) {
+			break
+		}
+		if body[i] != '{' {
+			return assertAlt{}, fmt.Errorf("invalid assert %q: expected '{' at offset %d", s, i)
+		}
+		i++
+		end := strings.IndexByte(body[i:], '}')
+		if end == -1 {
+			return assertAlt{}, fmt.Errorf("invalid assert %q: missing '}'", s)
+		}
+		var fields []string
+		for _, f := range strings.Split(body[i:i+end], ",") {
+			fields = append(fields, strings.TrimSpace(f))
+		}
+		a.rows = append(a.rows, fields)
+		i += end + 1
+	}
+	return a, nil
+}
+
+// parseAssert parses an expression after `assert`. Alternatives may be
+// chained with ` or `; the assertion holds if any alternative matches.
+func parseAssert(s string) (assertion, error) {
+	s = strings.TrimSpace(s)
+	a := assertion{raw: s}
+	for _, part := range splitOr(s) {
+		alt, err := parseAssertAlt(part)
+		if err != nil {
+			return assertion{}, err
+		}
+		a.alts = append(a.alts, alt)
+	}
+	return a, nil
+}
+
+// parseStep returns a zero step (sql == "") to indicate the line had no
+// command (blank, malformed, or comment-only).
+func parseStep(line string) (step, error) {
+	if idx := strings.Index(line, commentMarker); idx != -1 {
+		comment := strings.TrimSpace(line[idx+len(commentMarker):])
 		line = line[:idx]
+		if comment == assertPrefix || strings.HasPrefix(comment, assertPrefix+" ") {
+			expr := strings.TrimSpace(strings.TrimPrefix(comment, assertPrefix))
+			// Free-text comment after the assertion, delimited by `#`.
+			if idx := strings.Index(expr, "#"); idx != -1 {
+				expr = strings.TrimSpace(expr[:idx])
+			}
+			a, err := parseAssert(expr)
+			if err != nil {
+				return step{}, err
+			}
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) < 2 {
+				return step{}, nil
+			}
+			query := strings.TrimSpace(parts[1])
+			if query == "" {
+				return step{}, nil
+			}
+			return step{strings.TrimSpace(parts[0]), query, a}, nil
+		}
 	}
 	parts := strings.SplitN(line, ":", 2)
 	if len(parts) < 2 {
-		return step{}, false
+		return step{}, nil
 	}
 	query := strings.TrimSpace(parts[1])
 	if query == "" {
-		return step{}, false
+		return step{}, nil
 	}
-	return step{strings.TrimSpace(parts[0]), query, notes}, true
+	return step{strings.TrimSpace(parts[0]), query, assertion{}}, nil
 }
 
 func parseScript(f *os.File) (preconditions []string, steps []step, err error) {
@@ -84,11 +204,74 @@ func parseScript(f *os.File) (preconditions []string, steps []step, err error) {
 		post, pre = pre, nil
 	}
 	for _, line := range post {
-		if s, ok := parseStep(line); ok {
+		s, err := parseStep(line)
+		if err != nil {
+			return nil, nil, err
+		}
+		if s.sql != "" {
 			steps = append(steps, s)
 		}
 	}
 	return pre, steps, nil
+}
+
+// evalAssertAlt returns true if a single alternative is satisfied.
+// Row comparison is order-insensitive (multiset): SQL engines don't
+// guarantee row order without ORDER BY.
+func evalAssertAlt(a assertAlt, runErr error, rows [][]any) bool {
+	switch a.kind {
+	case assertError:
+		return runErr != nil
+	case assertOK:
+		return runErr == nil
+	case assertRows:
+		if runErr != nil || len(rows) != len(a.rows) {
+			return false
+		}
+		used := make([]bool, len(rows))
+		for _, want := range a.rows {
+			matched := false
+			for j, got := range rows {
+				if used[j] || !rowEqual(got, want) {
+					continue
+				}
+				used[j] = true
+				matched = true
+				break
+			}
+			if !matched {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func rowEqual(got []any, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i, v := range got {
+		if formatValue(v) != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// evalAssert returns "OK", "FAIL", or "" for no assertion. With multiple
+// alternatives, the assertion holds if any matches.
+func evalAssert(a assertion, runErr error, rows [][]any) string {
+	if len(a.alts) == 0 {
+		return ""
+	}
+	for _, alt := range a.alts {
+		if evalAssertAlt(alt, runErr, rows) {
+			return "OK"
+		}
+	}
+	return "FAIL"
 }
 
 // --- logger -----------------------------------------------------------------
@@ -142,7 +325,7 @@ func formatResultRow(row []any) string {
 	return "{" + strings.Join(parts, ", ") + "}"
 }
 
-func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, sc *screen, lg *logger) {
+func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, sc *screen, lg *logger, failures *atomic.Int64) {
 	for s := range ch {
 		start := time.Now()
 
@@ -150,7 +333,7 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 			"event":   "query_start",
 			"client":  id,
 			"command": s.sql,
-			"notes":   s.notes,
+			"assert":  s.assert.raw,
 			"time":    start.Format(time.RFC3339Nano),
 		})
 
@@ -159,7 +342,7 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 			command: s.sql,
 			start:   start.Format("15:04:05.000"),
 			end:     "pending",
-			notes:   s.notes,
+			assert:  s.assert.raw,
 		})
 
 		var (
@@ -204,7 +387,7 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 			"event":      "query_end",
 			"client":     id,
 			"command":    s.sql,
-			"notes":      s.notes,
+			"assert":     s.assert.raw,
 			"start_time": start.Format(time.RFC3339Nano),
 			"end_time":   end.Format(time.RFC3339Nano),
 			"elapsed_ms": end.Sub(start).Milliseconds(),
@@ -214,7 +397,7 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 			command: s.sql,
 			start:   start.Format("15:04:05.000"),
 			end:     end.Format("15:04:05.000"),
-			notes:   s.notes,
+			assert:  s.assert.raw,
 		}
 		if runErr != nil {
 			event["error"] = runErr.Error()
@@ -224,6 +407,14 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 			event["rows"] = resultRows
 			event["row_count"] = len(resultRows)
 			row.results = strings.Join(resultParts, "; ")
+		}
+		status := evalAssert(s.assert, runErr, resultRows)
+		row.assertStatus = status
+		if status != "" {
+			event["assert_status"] = status
+			if status == "FAIL" {
+				failures.Add(1)
+			}
 		}
 		lg.write(event)
 		sc.updateRow(idx, row)
@@ -295,7 +486,8 @@ func defaultPluginDir() string {
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatal(err)
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 }
 
@@ -446,6 +638,7 @@ func run() error {
 		return err
 	}
 
+	var failures atomic.Int64
 	clientChans := map[string]chan step{}
 	var wg sync.WaitGroup
 
@@ -483,7 +676,7 @@ func run() error {
 			wg.Add(1)
 			go func(id string, c *sql.Conn, ch chan step) {
 				defer wg.Done()
-				clientWork(ctx, id, c, ch, sc, lg)
+				clientWork(ctx, id, c, ch, sc, lg, &failures)
 			}(s.clientID, conn, ch)
 		}
 	}
@@ -531,24 +724,33 @@ func run() error {
 	}
 	wg.Wait()
 
+	failed := failures.Load()
 	sessionEnd := map[string]any{
-		"event": "session_end",
-		"time":  time.Now().Format(time.RFC3339Nano),
+		"event":           "session_end",
+		"time":            time.Now().Format(time.RFC3339Nano),
+		"assert_failures": failed,
 	}
 	if interrupted {
 		sessionEnd["reason"] = "interrupted"
 	}
 	lg.write(sessionEnd)
 
+	failErr := func() error {
+		if failed > 0 {
+			return fmt.Errorf("%d assertion(s) failed", failed)
+		}
+		return nil
+	}
+
 	// Skip the post-run pause when there's no TUI, nothing watching (pipe),
 	// or shutdown was already triggered.
 	if interrupted || sc == nil || !isTerminal(os.Stdout) {
-		return nil
+		return failErr()
 	}
 	sc.mu.Lock()
 	sc.allDone = true
 	sc.redrawAll()
 	sc.mu.Unlock()
 	<-ctx.Done()
-	return nil
+	return failErr()
 }

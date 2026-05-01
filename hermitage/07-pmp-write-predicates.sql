@@ -12,5 +12,5 @@ t2: $SHOW_ISOLATION;
 t1: update test set value = value + 10;
 t2: delete from test where value = 20;
 t1: commit;
-t2: select * from test where value = 20; -- Should fail in repeatable-read+.
+t2: select * from test where value = 20; -- assert error
 t2: commit;

@@ -10,8 +10,8 @@ t2: begin;
 t2: $SHOW_ISOLATION;
 
 t1: update test set value = 101 where id = 1;
-t2: select * from test; -- Read-committed+ should still show 1 => 11.
+t2: select * from test; -- assert [{1, 10}, {2, 20}]
 t1: update test set value = 11 where id = 1;
 t1: commit;
-t2: select * from test; -- Read-committed+ should still show 1 => 11.
+t2: select * from test; -- assert [{1, 11}, {2, 20}] or [{1, 10}, {2, 20}] # the latter is possible with snapshots
 t2: commit;

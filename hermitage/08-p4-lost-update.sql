@@ -13,7 +13,7 @@ t1: select * from test where id = 1;
 t2: select * from test where id = 1;
 
 t1: update test set value = 11 where id = 1;
-t2: update test set value = 11 where id = 1; -- Should fail in repeatable-read+.
+t2: update test set value = 11 where id = 1; -- assert error
 
 t1: commit;
 t2: commit;

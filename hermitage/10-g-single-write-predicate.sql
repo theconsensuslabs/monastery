@@ -15,5 +15,5 @@ t2: update test set value = 12 where id = 1;
 t2: update test set value = 18 where id = 2;
 t2: commit;
 
-t1: delete from test where value = 20; -- Should error on repeatable-read+.
+t1: delete from test where value = 20; -- assert error
 t1: rollback;

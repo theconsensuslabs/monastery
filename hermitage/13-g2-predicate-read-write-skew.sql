@@ -14,4 +14,4 @@ t2: select * from test where value % 3 = 0;
 t1: insert into test (id, value) values(3, 30);
 t2: insert into test (id, value) values(4, 42); 
 t1: commit;
-t2: commit; -- Should fail on serializable.
+t2: commit; -- assert error

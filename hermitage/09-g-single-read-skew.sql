@@ -17,5 +17,5 @@ t2: update test set value = 12 where id = 1;
 t2: update test set value = 18 where id = 2;
 t2: commit;
 
-t1: select * from test where id = 2; -- Should be 20 on repeatable-read+.
+t1: select * from test where id = 2; -- assert [{2, 20}]
 t1: commit;

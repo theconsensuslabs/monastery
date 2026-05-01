@@ -14,4 +14,4 @@ t2: select * from test where id in (1,2);
 t1: update test set value = 11 where id = 1;
 t2: update test set value = 21 where id = 2;
 t1: commit;
-t2: commit; -- Should fail in serializable.
+t2: commit; -- assert error
