@@ -10,13 +10,13 @@ t1: select * from test;
 
 t2: begin;
 t2: $SHOW_ISOLATION
-t2: update test set value = value + 5 where id = 2;
-t2: commit;
+t2: update test set value = value + 5 where id = 2; -- group cycle1
+t2: commit;                                         -- group cycle1
 
 t3: begin;
 t3: $SHOW_ISOLATION
 t3: select * from test;
 
-t3: commit;
-t1: update test set value = 0 where id = 1; -- assert error
-t1: abort;
+t3: commit;                                         -- group cycle1
+t1: update test set value = 0 where id = 1;         -- group cycle1
+t1: abort;                                          -- group cycle1

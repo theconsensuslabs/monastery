@@ -122,3 +122,30 @@ note and discarded:
 ```sql
 t2: select * from test;  -- assert ({1, 11}, {2, 20}) or ({1, 10}, {2, 20})  # latter under SI
 ```
+
+## Group invariants
+
+Per-step assertions hard-code which transaction the engine must abort.
+That works for SSI (deterministic victim by commit order) but breaks on
+S2PL implementations that resolve cycles via deadlock detection and may
+pick a different victim. To assert "*some* transaction in this cycle
+must abort, but I don't care which", tag each candidate step with
+`-- group <name>`:
+
+```sql
+t1: update test set value = 0 where id = 1;          -- group cycle1
+t2: update test set value = value + 5 where id = 2;  -- group cycle1
+```
+
+After the run, each named group is checked: at least one tagged step
+must have errored. The result appears as a synthetic row in the table
+(`group: at least one error`) and is logged as a `group_eval` event.
+
+`group` and `assert` are composable, separated by `;`:
+
+```sql
+t1: commit; -- assert ok; group cycle1
+```
+
+Group checks are skipped when the run is interrupted (Ctrl-C), since a
+missing member would spuriously fail the invariant.

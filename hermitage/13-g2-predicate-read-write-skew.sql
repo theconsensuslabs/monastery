@@ -11,7 +11,7 @@ t2: $SHOW_ISOLATION
 
 t1: select * from test where value % 3 = 0;
 t2: select * from test where value % 3 = 0;
-t1: insert into test (id, value) values(3, 30);
-t2: insert into test (id, value) values(4, 42); 
-t1: commit;
-t2: commit; -- assert error
+t1: insert into test (id, value) values(3, 30); -- group cycle1
+t2: insert into test (id, value) values(4, 42); -- group cycle1
+t1: commit;                                     -- group cycle1
+t2: commit;                                     -- group cycle1

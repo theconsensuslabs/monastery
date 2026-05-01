@@ -53,12 +53,14 @@ type step struct {
 	clientID string
 	sql      string
 	assert   assertion
+	group    string
 }
 
 // commentMarker requires surrounding whitespace so it doesn't collide with
 // `--` appearing inside SQL literals or identifiers.
 const commentMarker = " -- "
 const assertPrefix = "assert"
+const groupPrefix = "group"
 
 // splitOr splits an assert expression on top-level ` or ` separators,
 // ignoring occurrences inside `(...)` or `{...}`.
@@ -141,31 +143,53 @@ func parseAssert(s string) (assertion, error) {
 	return a, nil
 }
 
+// parseDirectives parses the comment portion after ` -- ` as a `;`-separated
+// list of directives. Free text after `#` is dropped. Recognized directives
+// are `assert <expr>` and `group <name>`; both are optional and composable.
+func parseDirectives(comment string) (assertion, string, error) {
+	if idx := strings.Index(comment, "#"); idx != -1 {
+		comment = strings.TrimSpace(comment[:idx])
+	}
+	var a assertion
+	var group string
+	for _, raw := range strings.Split(comment, ";") {
+		d := strings.TrimSpace(raw)
+		if d == "" {
+			continue
+		}
+		switch {
+		case d == assertPrefix || strings.HasPrefix(d, assertPrefix+" "):
+			expr := strings.TrimSpace(strings.TrimPrefix(d, assertPrefix))
+			parsed, err := parseAssert(expr)
+			if err != nil {
+				return assertion{}, "", err
+			}
+			a = parsed
+		case strings.HasPrefix(d, groupPrefix+" "):
+			name := strings.TrimSpace(strings.TrimPrefix(d, groupPrefix))
+			if name == "" {
+				return assertion{}, "", fmt.Errorf("invalid group directive: missing name")
+			}
+			group = name
+		default:
+			return assertion{}, "", fmt.Errorf("unknown directive %q (expected `assert ...` or `group <name>`)", d)
+		}
+	}
+	return a, group, nil
+}
+
 // parseStep returns a zero step (sql == "") to indicate the line had no
 // command (blank, malformed, or comment-only).
 func parseStep(line string) (step, error) {
+	var a assertion
+	var group string
 	if idx := strings.Index(line, commentMarker); idx != -1 {
 		comment := strings.TrimSpace(line[idx+len(commentMarker):])
 		line = line[:idx]
-		if comment == assertPrefix || strings.HasPrefix(comment, assertPrefix+" ") {
-			expr := strings.TrimSpace(strings.TrimPrefix(comment, assertPrefix))
-			// Free-text comment after the assertion, delimited by `#`.
-			if idx := strings.Index(expr, "#"); idx != -1 {
-				expr = strings.TrimSpace(expr[:idx])
-			}
-			a, err := parseAssert(expr)
-			if err != nil {
-				return step{}, err
-			}
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) < 2 {
-				return step{}, nil
-			}
-			query := strings.TrimSpace(parts[1])
-			if query == "" {
-				return step{}, nil
-			}
-			return step{strings.TrimSpace(parts[0]), query, a}, nil
+		var err error
+		a, group, err = parseDirectives(comment)
+		if err != nil {
+			return step{}, err
 		}
 	}
 	parts := strings.SplitN(line, ":", 2)
@@ -176,7 +200,7 @@ func parseStep(line string) (step, error) {
 	if query == "" {
 		return step{}, nil
 	}
-	return step{strings.TrimSpace(parts[0]), query, assertion{}}, nil
+	return step{strings.TrimSpace(parts[0]), query, a, group}, nil
 }
 
 func parseScript(f *os.File) (preconditions []string, steps []step, err error) {
@@ -366,7 +390,87 @@ func formatRows(rows [][]any) string {
 	return "(" + strings.Join(parts, ", ") + ")"
 }
 
-func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, sc *screen, lg *logger, failures *atomic.Int64) {
+// groupTracker collects per-step error outcomes for steps tagged with
+// `-- group <name>`. After all workers exit, evalGroups walks each named
+// group and asserts that at least one member errored — the cycle-victim
+// invariant for engines where the choice of victim is non-deterministic.
+type groupTracker struct {
+	mu      sync.Mutex
+	members map[string][]groupMember
+}
+
+type groupMember struct {
+	client  string
+	sql     string
+	errored bool
+}
+
+func newGroupTracker() *groupTracker {
+	return &groupTracker{members: map[string][]groupMember{}}
+}
+
+func (g *groupTracker) record(group, client, sql string, errored bool) {
+	if group == "" {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.members[group] = append(g.members[group], groupMember{client, sql, errored})
+}
+
+// groupOrder returns the unique group names in the order they first appear
+// in the script. Stable iteration matters for the display table.
+func groupOrder(steps []step) []string {
+	seen := map[string]bool{}
+	var order []string
+	for _, s := range steps {
+		if s.group != "" && !seen[s.group] {
+			seen[s.group] = true
+			order = append(order, s.group)
+		}
+	}
+	return order
+}
+
+// evalGroups walks each named group and emits an OK/FAIL row for the
+// "at least one member errored" invariant. Synthetic rows are appended
+// to the display so the dump captures them.
+func evalGroups(steps []step, tracker *groupTracker, sc *screen, lg *logger, failures *atomic.Int64) {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	for _, name := range groupOrder(steps) {
+		members := tracker.members[name]
+		errored := 0
+		for _, m := range members {
+			if m.errored {
+				errored++
+			}
+		}
+		status := "OK"
+		if errored == 0 {
+			status = "FAIL"
+			failures.Add(1)
+		}
+		summary := fmt.Sprintf("%d/%d errored", errored, len(members))
+		lg.write(map[string]any{
+			"event":         "group_eval",
+			"group":         name,
+			"members":       len(members),
+			"errored":       errored,
+			"assert_status": status,
+		})
+		if sc != nil {
+			sc.addRow(rowData{
+				client:       name,
+				command:      summary,
+				assert:       "group: at least one error",
+				assertStatus: status,
+			})
+		}
+	}
+}
+
+func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, sc *screen, lg *logger, failures *atomic.Int64, groups *groupTracker) {
 	for s := range ch {
 		start := time.Now()
 
@@ -455,6 +559,7 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 				failures.Add(1)
 			}
 		}
+		groups.record(s.group, id, s.sql, runErr != nil)
 		lg.write(event)
 		sc.updateRow(idx, row)
 	}
@@ -678,6 +783,7 @@ func run() error {
 	}
 
 	var failures atomic.Int64
+	groups := newGroupTracker()
 	clientChans := map[string]chan step{}
 	var wg sync.WaitGroup
 
@@ -715,7 +821,7 @@ func run() error {
 			wg.Add(1)
 			go func(id string, c *sql.Conn, ch chan step) {
 				defer wg.Done()
-				clientWork(ctx, id, c, ch, sc, lg, &failures)
+				clientWork(ctx, id, c, ch, sc, lg, &failures, groups)
 			}(s.clientID, conn, ch)
 		}
 	}
@@ -762,6 +868,12 @@ func run() error {
 		close(ch)
 	}
 	wg.Wait()
+
+	// Group invariants are only meaningful when every member ran. After an
+	// interrupt, missing members would spuriously fail their group.
+	if !interrupted {
+		evalGroups(steps, groups, sc, lg, &failures)
+	}
 
 	failed := failures.Load()
 	sessionEnd := map[string]any{
