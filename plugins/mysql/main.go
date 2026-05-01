@@ -18,3 +18,7 @@ func IsolationSQL(level string) string {
 	}
 	return "SET TRANSACTION ISOLATION LEVEL " + l
 }
+
+func ShowIsolationSQL() string {
+	return "SELECT @@transaction_isolation"
+}

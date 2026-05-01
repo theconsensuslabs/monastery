@@ -17,3 +17,7 @@ func IsolationSQL(level string) string {
 	}
 	return "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL " + l
 }
+
+func ShowIsolationSQL() string {
+	return "SHOW transaction_isolation"
+}

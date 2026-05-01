@@ -4,8 +4,10 @@ insert into test (id, value) values (1, 10), (2, 20);
 
 ---
 
-t1: begin
-t2: begin
+t1: begin;
+t1: $SHOW_ISOLATION;
+t2: begin;
+t2: $SHOW_ISOLATION;
 t1: select * from test where value = 30;
 t2: insert into test (id, value) values(3, 30);
 t2: commit;

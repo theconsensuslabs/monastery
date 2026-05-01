@@ -850,6 +850,16 @@ func run() error {
 		return fmt.Errorf("unknown isolation level %q for driver %s", isolationLevel, driver)
 	}
 
+	showSym, err := p.Lookup("ShowIsolationSQL")
+	if err != nil {
+		return fmt.Errorf("plugin %s missing ShowIsolationSQL symbol", pluginPath)
+	}
+	showIsolationSQLFn, ok := showSym.(func() string)
+	if !ok {
+		return fmt.Errorf("plugin %s: ShowIsolationSQL has wrong type", pluginPath)
+	}
+	showSQL := showIsolationSQLFn()
+
 	f, err := os.Open(scriptPath)
 	if err != nil {
 		return fmt.Errorf("open script: %w", err)
@@ -859,6 +869,13 @@ func run() error {
 	preconditions, steps, err := parseScript(f)
 	if err != nil {
 		return fmt.Errorf("parse script: %w", err)
+	}
+
+	for i, p := range preconditions {
+		preconditions[i] = strings.ReplaceAll(p, "$SHOW_ISOLATION", showSQL)
+	}
+	for i := range steps {
+		steps[i].sql = strings.ReplaceAll(steps[i].sql, "$SHOW_ISOLATION", showSQL)
 	}
 
 	db, err := sql.Open(driver, dsn)
