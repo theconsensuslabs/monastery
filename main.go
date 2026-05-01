@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -35,8 +36,30 @@ type step struct {
 	notes    string
 }
 
+// notesMarker requires surrounding whitespace so it doesn't collide with
+// `--` appearing inside SQL literals or identifiers.
+const notesMarker = " -- "
+
+func parseStep(line string) (step, bool) {
+	var notes string
+	if idx := strings.Index(line, notesMarker); idx != -1 {
+		notes = strings.TrimSpace(line[idx+len(notesMarker):])
+		line = line[:idx]
+	}
+	parts := strings.SplitN(line, ":", 2)
+	if len(parts) < 2 {
+		return step{}, false
+	}
+	query := strings.TrimSpace(parts[1])
+	if query == "" {
+		return step{}, false
+	}
+	return step{strings.TrimSpace(parts[0]), query, notes}, true
+}
+
 func parseScript(f *os.File) (preconditions []string, steps []step, err error) {
 	scanner := bufio.NewScanner(f)
+	var pre, post []string
 	seenSeparator := false
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -47,44 +70,25 @@ func parseScript(f *os.File) (preconditions []string, steps []step, err error) {
 			seenSeparator = true
 			continue
 		}
-		if !seenSeparator {
-			preconditions = append(preconditions, line)
-			continue
-		}
-		var notes string
-		if idx := strings.Index(line, "--"); idx != -1 {
-			notes = strings.TrimSpace(line[idx+2:])
-			line = line[:idx]
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) < 2 {
-			continue
-		}
-		query := strings.TrimSpace(parts[1])
-		if query != "" {
-			steps = append(steps, step{strings.TrimSpace(parts[0]), query, notes})
+		if seenSeparator {
+			post = append(post, line)
+		} else {
+			pre = append(pre, line)
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return nil, nil, err
+	}
+	// no separator: everything was steps, not preconditions
 	if !seenSeparator {
-		// no separator: everything was steps, not preconditions
-		for _, line := range preconditions {
-			var notes string
-			if idx := strings.Index(line, "--"); idx != -1 {
-				notes = strings.TrimSpace(line[idx+2:])
-				line = line[:idx]
-			}
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) < 2 {
-				continue
-			}
-			query := strings.TrimSpace(parts[1])
-			if query != "" {
-				steps = append(steps, step{strings.TrimSpace(parts[0]), query, notes})
-			}
-		}
-		preconditions = nil
+		post, pre = pre, nil
 	}
-	return preconditions, steps, scanner.Err()
+	for _, line := range post {
+		if s, ok := parseStep(line); ok {
+			steps = append(steps, s)
+		}
+	}
+	return pre, steps, nil
 }
 
 // --- logger -----------------------------------------------------------------
@@ -143,15 +147,15 @@ var colHeaders = [numCols]string{
 	"CLIENT", "COMMAND", "STARTED", "ENDED", "RESULTS", "ERROR", "NOTES",
 }
 
-var colOffsets [numCols]int
-
-func init() {
+var colOffsets = func() [numCols]int {
+	var off [numCols]int
 	x := 1
 	for i, w := range colWidths {
-		colOffsets[i] = x
+		off[i] = x
 		x += w + 1
 	}
-}
+	return off
+}()
 
 func totalWidth() int {
 	w := 1
@@ -163,6 +167,8 @@ func totalWidth() int {
 
 // --- text wrapping ----------------------------------------------------------
 
+// wrapText breaks text into lines no wider than width, preferring whitespace
+// boundaries. Falls back to a hard wrap when no space fits.
 func wrapText(text string, width int) []string {
 	if width <= 0 {
 		return []string{text}
@@ -172,14 +178,23 @@ func wrapText(text string, width int) []string {
 		return []string{""}
 	}
 	var lines []string
-	for len(runes) > 0 {
-		end := width
-		if end > len(runes) {
-			end = len(runes)
+	for len(runes) > width {
+		breakAt := -1
+		for i := width; i > 0; i-- {
+			if runes[i] == ' ' {
+				breakAt = i
+				break
+			}
 		}
-		lines = append(lines, string(runes[:end]))
-		runes = runes[end:]
+		if breakAt > 0 {
+			lines = append(lines, string(runes[:breakAt]))
+			runes = runes[breakAt+1:]
+		} else {
+			lines = append(lines, string(runes[:width]))
+			runes = runes[width:]
+		}
 	}
+	lines = append(lines, string(runes))
 	return lines
 }
 
@@ -217,6 +232,7 @@ type screen struct {
 	scrollOffset int
 	interactive  bool
 	allDone      bool
+	dumping      bool
 	dump         string
 }
 
@@ -235,11 +251,7 @@ func (sc *screen) captureDump() string {
 		sb.WriteString(strings.TrimRight(string(line), " "))
 		sb.WriteRune('\n')
 	}
-	out := sb.String()
-	if idx := strings.LastIndex(out, "┘\n"); idx != -1 {
-		out = out[:idx+len("┘\n")]
-	}
-	return out
+	return strings.TrimRight(sb.String(), "\n") + "\n"
 }
 
 func newScreen() (*screen, error) {
@@ -267,16 +279,10 @@ func (sc *screen) pollEvents(cancel context.CancelFunc, nextStep chan<- struct{}
 			case tcell.KeyDown:
 				sc.scroll(1)
 			case tcell.KeyEscape:
-				sc.mu.Lock()
-				sc.dump = sc.captureDump()
-				sc.mu.Unlock()
 				cancel()
 				return
 			default:
 				if ev.Rune() == 'q' || ev.Rune() == 'Q' {
-					sc.mu.Lock()
-					sc.dump = sc.captureDump()
-					sc.mu.Unlock()
 					cancel()
 					return
 				}
@@ -292,16 +298,41 @@ func (sc *screen) pollEvents(cancel context.CancelFunc, nextStep chan<- struct{}
 			sc.s.Sync()
 			sc.redrawAll()
 			sc.mu.Unlock()
+		case *tcell.EventInterrupt:
+			return
 		}
 	}
+}
+
+// contentBounds returns the y-range available for rows. The status bar
+// occupies y=h-1 in normal mode; when content overflows, an extra row is
+// reserved at the top (for ↑ more) and bottom (for ↓ more). Dumping mode
+// uses the entire screen so the saved table has no spurious blank rows.
+func contentBounds(h, total int, dumping bool) (top, bottom, visible int) {
+	top = headerLines
+	if dumping {
+		bottom = h
+	} else {
+		bottom = h - 1
+	}
+	visible = bottom - top
+	if !dumping && total > visible {
+		top++
+		bottom--
+		visible = bottom - top
+	}
+	if visible < 0 {
+		visible = 0
+	}
+	return
 }
 
 func (sc *screen) scroll(delta int) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	total := sc.totalContentLines()
 	_, h := sc.s.Size()
-	visible := h - headerLines
+	total := sc.totalContentLines()
+	_, _, visible := contentBounds(h, total, false)
 	maxScroll := total - visible
 	if maxScroll < 0 {
 		maxScroll = 0
@@ -367,7 +398,6 @@ func (sc *screen) drawLogicalRow(y int, r rowData, firstLine int) int {
 	defaultStyle := tcell.StyleDefault
 	pendingStyle := tcell.StyleDefault.Foreground(tcell.ColorYellow)
 	errorStyle := tcell.StyleDefault.Foreground(tcell.ColorRed)
-	notesStyle := tcell.StyleDefault
 
 	endStyle := defaultStyle
 	if r.end == "pending" {
@@ -379,7 +409,7 @@ func (sc *screen) drawLogicalRow(y int, r rowData, firstLine int) int {
 	}
 	styles := [numCols]tcell.Style{
 		defaultStyle, defaultStyle, defaultStyle,
-		endStyle, defaultStyle, errStyle, notesStyle,
+		endStyle, defaultStyle, errStyle, defaultStyle,
 	}
 
 	wrapped, numLines := rowLines(r)
@@ -431,7 +461,9 @@ const headerLines = 3
 func (sc *screen) redrawAll() {
 	sc.s.Clear()
 	sc.drawHeader()
-	_, h := sc.s.Size()
+	w, h := sc.s.Size()
+	total := sc.totalContentLines()
+	contentTop, contentBottom, visible := contentBounds(h, total, sc.dumping)
 
 	skipped := 0
 	for i, r := range sc.rows {
@@ -449,14 +481,14 @@ func (sc *screen) redrawAll() {
 			firstLine = -startLine
 			startLine = 0
 		}
-		screenY := headerLines + startLine
-		if screenY >= h {
+		screenY := contentTop + startLine
+		if screenY >= contentBottom {
 			break
 		}
 
 		drawn := sc.drawLogicalRow(screenY, r, firstLine)
 		divY := screenY + drawn
-		if divY < h {
+		if divY < contentBottom {
 			if i < len(sc.rows)-1 {
 				sc.drawHRule(divY)
 			} else {
@@ -467,18 +499,20 @@ func (sc *screen) redrawAll() {
 		skipped += rowScreenLines
 	}
 
+	if sc.dumping {
+		sc.s.Show()
+		return
+	}
+
+	dim := tcell.StyleDefault.Dim(true)
 	if sc.scrollOffset > 0 {
-		hint := " ↑ more "
-		for i, ch := range []rune(hint) {
-			sc.s.SetContent(i, headerLines, ch, nil, tcell.StyleDefault.Dim(true))
+		for i, ch := range []rune(" ↑ more ") {
+			sc.s.SetContent(i, headerLines, ch, nil, dim)
 		}
 	}
-	total := sc.totalContentLines()
-	w, h2 := sc.s.Size()
-	if sc.scrollOffset+h2-headerLines < total {
-		hint := " ↓ more "
-		for i, ch := range []rune(hint) {
-			sc.s.SetContent(i, h2-1, ch, nil, tcell.StyleDefault.Dim(true))
+	if sc.scrollOffset+visible < total {
+		for i, ch := range []rune(" ↓ more ") {
+			sc.s.SetContent(i, h-2, ch, nil, dim)
 		}
 	}
 
@@ -493,9 +527,8 @@ func (sc *screen) redrawAll() {
 	if startX < 0 {
 		startX = 0
 	}
-	dimStyle := tcell.StyleDefault.Dim(true)
 	for i, ch := range hintRunes {
-		sc.s.SetContent(startX+i, h2-1, ch, nil, dimStyle)
+		sc.s.SetContent(startX+i, h-1, ch, nil, dim)
 	}
 
 	sc.s.Show()
@@ -528,6 +561,21 @@ func (sc *screen) fini() {
 
 // --- worker -----------------------------------------------------------------
 
+func formatValue(v any) string {
+	if b, ok := v.([]byte); ok {
+		return string(b)
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+func formatResultRow(row []any) string {
+	parts := make([]string, len(row))
+	for i, v := range row {
+		parts[i] = formatValue(v)
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
 func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, sc *screen, lg *logger) {
 	for s := range ch {
 		start := time.Now()
@@ -548,92 +596,45 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 			notes:   s.notes,
 		})
 
+		var (
+			cols        []string
+			resultParts []string
+			resultRows  [][]any
+			runErr      error
+		)
+
 		rows, err := conn.QueryContext(ctx, s.sql)
 		if err != nil {
-			end := time.Now()
-			lg.write(map[string]any{
-				"event":      "query_end",
-				"client":     id,
-				"command":    s.sql,
-				"notes":      s.notes,
-				"start_time": start.Format(time.RFC3339Nano),
-				"end_time":   end.Format(time.RFC3339Nano),
-				"elapsed_ms": end.Sub(start).Milliseconds(),
-				"error":      err.Error(),
-			})
-			sc.updateRow(idx, rowData{
-				client:  id,
-				command: s.sql,
-				start:   start.Format("15:04:05.000"),
-				end:     end.Format("15:04:05.000"),
-				err:     err.Error(),
-				notes:   s.notes,
-			})
-			continue
-		}
-
-		cols, _ := rows.Columns()
-		var resultParts []string
-		var resultRows [][]any
-		var scanErr error
-		if len(cols) > 0 {
-			vals := make([]any, len(cols))
-			ptrs := make([]any, len(cols))
-			for i := range vals {
-				ptrs[i] = &vals[i]
-			}
-			for rows.Next() {
-				if err := rows.Scan(ptrs...); err != nil {
-					scanErr = err
-					break
+			runErr = err
+		} else {
+			cols, runErr = rows.Columns()
+			if runErr == nil && len(cols) > 0 {
+				vals := make([]any, len(cols))
+				ptrs := make([]any, len(cols))
+				for i := range vals {
+					ptrs[i] = &vals[i]
 				}
-				row := make([]any, len(vals))
-				copy(row, vals)
-				parts := make([]string, len(row))
-				for i, v := range row {
-					if b, ok := v.([]byte); ok {
-						parts[i] = string(b)
-					} else {
-						parts[i] = fmt.Sprintf("%v", v)
+				for rows.Next() {
+					if err := rows.Scan(ptrs...); err != nil {
+						runErr = err
+						break
 					}
+					row := make([]any, len(vals))
+					copy(row, vals)
+					resultParts = append(resultParts, formatResultRow(row))
+					resultRows = append(resultRows, row)
 				}
-				resultParts = append(resultParts, "["+strings.Join(parts, " ")+"]")
-				resultRows = append(resultRows, row)
 			}
-		}
-		iterErr := rows.Err()
-		if err := rows.Close(); err != nil {
-			log.Fatalf("unexpected error on close [%s]: %s", id, err)
-		}
-		if scanErr != nil || iterErr != nil {
-			rowErr := scanErr
-			if rowErr == nil {
-				rowErr = iterErr
+			if runErr == nil {
+				runErr = rows.Err()
 			}
-			end := time.Now()
-			lg.write(map[string]any{
-				"event":      "query_end",
-				"client":     id,
-				"command":    s.sql,
-				"notes":      s.notes,
-				"start_time": start.Format(time.RFC3339Nano),
-				"end_time":   end.Format(time.RFC3339Nano),
-				"elapsed_ms": end.Sub(start).Milliseconds(),
-				"error":      rowErr.Error(),
-			})
-			sc.updateRow(idx, rowData{
-				client:  id,
-				command: s.sql,
-				start:   start.Format("15:04:05.000"),
-				end:     end.Format("15:04:05.000"),
-				err:     rowErr.Error(),
-				notes:   s.notes,
-			})
-			continue
+			if err := rows.Close(); err != nil && runErr == nil {
+				runErr = err
+			}
 		}
 
 		end := time.Now()
-		lg.write(map[string]any{
+		event := map[string]any{
 			"event":      "query_end",
 			"client":     id,
 			"command":    s.sql,
@@ -641,20 +642,79 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 			"start_time": start.Format(time.RFC3339Nano),
 			"end_time":   end.Format(time.RFC3339Nano),
 			"elapsed_ms": end.Sub(start).Milliseconds(),
-			"columns":    cols,
-			"rows":       resultRows,
-			"row_count":  len(resultRows),
-		})
-
-		sc.updateRow(idx, rowData{
+		}
+		row := rowData{
 			client:  id,
 			command: s.sql,
 			start:   start.Format("15:04:05.000"),
 			end:     end.Format("15:04:05.000"),
-			results: strings.Join(resultParts, "; "),
 			notes:   s.notes,
-		})
+		}
+		if runErr != nil {
+			event["error"] = runErr.Error()
+			row.err = runErr.Error()
+		} else {
+			event["columns"] = cols
+			event["rows"] = resultRows
+			event["row_count"] = len(resultRows)
+			row.results = strings.Join(resultParts, "; ")
+		}
+		lg.write(event)
+		sc.updateRow(idx, row)
 	}
+}
+
+// --- preconditions ----------------------------------------------------------
+
+func runPreconditions(ctx context.Context, db *sql.DB, sc *screen, lg *logger, driver string, preconditions []string) error {
+	if len(preconditions) == 0 {
+		return nil
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("precondition conn: %w", err)
+	}
+	defer conn.Close()
+	for _, sqlText := range preconditions {
+		start := time.Now()
+		lg.write(map[string]any{
+			"event":   "precondition_start",
+			"command": sqlText,
+			"time":    start.Format(time.RFC3339Nano),
+			"driver":  driver,
+		})
+		idx := sc.addRow(rowData{
+			client:  "setup",
+			command: sqlText,
+			start:   start.Format("15:04:05.000"),
+			end:     "pending",
+		})
+		_, execErr := conn.ExecContext(ctx, sqlText)
+		end := time.Now()
+		event := map[string]any{
+			"event":      "precondition_end",
+			"command":    sqlText,
+			"start_time": start.Format(time.RFC3339Nano),
+			"end_time":   end.Format(time.RFC3339Nano),
+			"elapsed_ms": end.Sub(start).Milliseconds(),
+		}
+		row := rowData{
+			client:  "setup",
+			command: sqlText,
+			start:   start.Format("15:04:05.000"),
+			end:     end.Format("15:04:05.000"),
+		}
+		if execErr != nil {
+			event["error"] = execErr.Error()
+			row.err = execErr.Error()
+		}
+		lg.write(event)
+		sc.updateRow(idx, row)
+		if execErr != nil {
+			return fmt.Errorf("precondition %q: %w", sqlText, execErr)
+		}
+	}
+	return nil
 }
 
 // --- main -------------------------------------------------------------------
@@ -667,17 +727,31 @@ func defaultPluginDir() string {
 	return filepath.Dir(exe)
 }
 
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
 func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
 	interval := flag.Duration("interval", 3*time.Second, "delay between dispatching each step (e.g. 500ms, 1s, 1m)")
 	interactive := flag.Bool("interactive", false, "wait for any keypress before dispatching each step")
-	run := flag.Bool("run", false, "dispatch all steps immediately, dump output, and exit")
+	runFlag := flag.Bool("run", false, "dispatch all steps immediately, dump output, and exit")
 	logPath := flag.String("log", "monastery.jsonl", "path to JSON log file")
 	pluginDir := flag.String("plugin-dir", defaultPluginDir(), "directory containing driver plugin .so files")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) < 4 {
-		log.Fatal("usage: monastery [-interval <duration>] [-interactive] [-log <path>] <driver> <dsn> <isolation level> <script>\n" +
+		return errors.New("usage: monastery [-interval <duration>] [-interactive] [-log <path>] <driver> <dsn> <isolation level> <script>\n" +
 			"  -interval duration  delay between steps (default 3s, e.g. 500ms, 1m)\n" +
 			"  -interactive        wait for keypress before each step instead of using interval\n" +
 			"  -run                dispatch all steps immediately, dump output, and exit\n" +
@@ -693,35 +767,35 @@ func main() {
 	pluginPath := filepath.Join(*pluginDir, driver+".so")
 	p, err := plugin.Open(pluginPath)
 	if err != nil {
-		log.Fatalf("load driver plugin %s: %v", pluginPath, err)
+		return fmt.Errorf("load driver plugin %s: %w", pluginPath, err)
 	}
 	sym, err := p.Lookup("IsolationSQL")
 	if err != nil {
-		log.Fatalf("plugin %s missing IsolationSQL symbol", pluginPath)
+		return fmt.Errorf("plugin %s missing IsolationSQL symbol", pluginPath)
 	}
 	isolationSQLFn, ok := sym.(func(string) string)
 	if !ok {
-		log.Fatalf("plugin %s: IsolationSQL has wrong type", pluginPath)
+		return fmt.Errorf("plugin %s: IsolationSQL has wrong type", pluginPath)
 	}
 	setSQL := isolationSQLFn(isolationLevel)
 	if setSQL == "" {
-		log.Fatalf("unknown isolation level %q for driver %s", isolationLevel, driver)
+		return fmt.Errorf("unknown isolation level %q for driver %s", isolationLevel, driver)
 	}
 
 	f, err := os.Open(scriptPath)
 	if err != nil {
-		log.Fatal("open script:", err)
+		return fmt.Errorf("open script: %w", err)
 	}
 	defer f.Close()
 
 	preconditions, steps, err := parseScript(f)
 	if err != nil {
-		log.Fatal("parse script:", err)
+		return fmt.Errorf("parse script: %w", err)
 	}
 
 	db, err := sql.Open(driver, dsn)
 	if err != nil {
-		log.Fatal("open db:", err)
+		return fmt.Errorf("open db: %w", err)
 	}
 	defer db.Close()
 
@@ -729,7 +803,7 @@ func main() {
 
 	lg, err := newLogger(*logPath, runID)
 	if err != nil {
-		log.Fatal("open log:", err)
+		return fmt.Errorf("open log: %w", err)
 	}
 	defer lg.close()
 
@@ -741,49 +815,23 @@ func main() {
 		"interval_ms":     interval.Milliseconds(),
 	})
 
-	if len(preconditions) > 0 {
-		conn, err := db.Conn(context.Background())
-		if err != nil {
-			log.Fatal("precondition conn:", err)
-		}
-		for _, sql := range preconditions {
-			start := time.Now()
-			lg.write(map[string]any{
-				"event":   "precondition_start",
-				"command": sql,
-				"time":    start.Format(time.RFC3339Nano),
-				"driver":  driver,
-			})
-			_, execErr := conn.ExecContext(context.Background(), sql)
-			end := time.Now()
-			event := map[string]any{
-				"event":      "precondition_end",
-				"command":    sql,
-				"start_time": start.Format(time.RFC3339Nano),
-				"end_time":   end.Format(time.RFC3339Nano),
-				"elapsed_ms": end.Sub(start).Milliseconds(),
-			}
-			if execErr != nil {
-				event["error"] = execErr.Error()
-				lg.write(event)
-				conn.Close()
-				log.Fatalf("precondition %q: %v", sql, execErr)
-			}
-			lg.write(event)
-		}
-		conn.Close()
-	}
-
 	sc, err := newScreen()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer func() {
-		sc.fini()
-		if sc.dump != "" {
-			fmt.Print(sc.dump)
+		sc.mu.Lock()
+		if sc.dump == "" {
+			sc.dumping = true
+			sc.redrawAll()
+			sc.dump = sc.captureDump()
 		}
-
+		dump := sc.dump
+		sc.mu.Unlock()
+		sc.fini()
+		if dump != "" {
+			fmt.Print(dump)
+		}
 		fmt.Println(runID)
 	}()
 	sc.interactive = *interactive
@@ -791,26 +839,44 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigs)
+	go func() {
+		select {
+		case <-sigs:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	// Wake pollEvents on shutdown so it can exit cleanly instead of
+	// blocking on a finalized screen.
+	go func() {
+		<-ctx.Done()
+		sc.s.PostEvent(tcell.NewEventInterrupt(nil))
+	}()
+
 	var nextStep chan struct{}
 	if *interactive {
 		nextStep = make(chan struct{}, 1)
 	}
-	if !*run {
+	if !*runFlag {
 		go sc.pollEvents(cancel, nextStep)
 	}
 
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigs
-		cancel()
-	}()
+	if err := runPreconditions(ctx, db, sc, lg, driver, preconditions); err != nil {
+		return err
+	}
 
 	clientChans := map[string]chan step{}
 	var wg sync.WaitGroup
 
 	var workerConnsMu sync.Mutex
 	var workerConns []*sql.Conn
+	// On cancel, close worker connections to unblock any in-flight queries
+	// that don't honor ctx mid-read. Workers translate the resulting error
+	// into a row-level error rather than crashing.
 	go func() {
 		<-ctx.Done()
 		workerConnsMu.Lock()
@@ -822,14 +888,13 @@ func main() {
 
 	for _, s := range steps {
 		if _, ok := clientChans[s.clientID]; !ok {
-			conn, err := db.Conn(context.Background())
+			conn, err := db.Conn(ctx)
 			if err != nil {
-				sc.fini()
-				log.Fatal("get conn:", err)
+				return fmt.Errorf("get conn for %s: %w", s.clientID, err)
 			}
-			if _, err := conn.ExecContext(context.Background(), setSQL); err != nil {
-				sc.fini()
-				log.Fatalf("set isolation level on %s: %v", s.clientID, err)
+			if _, err := conn.ExecContext(ctx, setSQL); err != nil {
+				conn.Close()
+				return fmt.Errorf("set isolation level on %s: %w", s.clientID, err)
 			}
 			workerConnsMu.Lock()
 			workerConns = append(workerConns, conn)
@@ -846,61 +911,70 @@ func main() {
 		}
 	}
 
-	if *run {
+	interrupted := false
+	dispatch := func(wait func() bool) {
 		for _, s := range steps {
-			clientChans[s.clientID] <- s
-		}
-	} else if *interactive {
-		for _, s := range steps {
-			clientChans[s.clientID] <- s
 			select {
+			case clientChans[s.clientID] <- s:
 			case <-ctx.Done():
-				goto shutdown
-			case <-nextStep:
+				interrupted = true
+				return
+			}
+			if !wait() {
+				interrupted = true
+				return
 			}
 		}
-	} else {
+	}
+
+	switch {
+	case *runFlag:
+		dispatch(func() bool { return true })
+	case *interactive:
+		dispatch(func() bool {
+			select {
+			case <-ctx.Done():
+				return false
+			case <-nextStep:
+				return true
+			}
+		})
+	default:
 		ticker := time.NewTicker(*interval)
 		defer ticker.Stop()
-		for _, s := range steps {
-			clientChans[s.clientID] <- s
+		dispatch(func() bool {
 			select {
 			case <-ctx.Done():
-				goto shutdown
+				return false
 			case <-ticker.C:
+				return true
 			}
-		}
+		})
 	}
 
 	for _, ch := range clientChans {
 		close(ch)
 	}
 	wg.Wait()
-	lg.write(map[string]any{
+
+	sessionEnd := map[string]any{
 		"event": "session_end",
 		"time":  time.Now().Format(time.RFC3339Nano),
-	})
-	if *run {
-		sc.mu.Lock()
-		sc.dump = sc.captureDump()
-		sc.mu.Unlock()
-		return
+	}
+	if interrupted {
+		sessionEnd["reason"] = "interrupted"
+	}
+	lg.write(sessionEnd)
+
+	// Skip the post-run pause when there's nothing watching (pipe), when
+	// the user asked for a one-shot, or when shutdown was already triggered.
+	if interrupted || *runFlag || !isTerminal(os.Stdout) {
+		return nil
 	}
 	sc.mu.Lock()
 	sc.allDone = true
 	sc.redrawAll()
 	sc.mu.Unlock()
 	<-ctx.Done()
-	return
-
-shutdown:
-	for _, ch := range clientChans {
-		close(ch)
-	}
-	wg.Wait()
-	lg.write(map[string]any{
-		"event":  "session_end",
-		"time":   time.Now().Format(time.RFC3339Nano),
-		"reason": "interrupted",
-	})
+	return nil
 }
