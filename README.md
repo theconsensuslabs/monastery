@@ -85,106 +85,6 @@ $ ./run-hermitage.sh postgres 'host=localhost port=4000 sslmode=disable dbname=p
 
 Per-run JSONL logs and stdout/stderr land in `.hermitage-logs/` for inspection.
 
-## Assertions
-
-Each step can carry an `assert` after a `--`. The result is shown in the
-`ASSERT` column (green when it holds, red when it doesn't), and `monastery`
-exits non-zero if any assertion fails.
-
-| Form                            | Passes when                                |
-|---------------------------------|--------------------------------------------|
-| `-- assert error`               | the statement returned an error            |
-| `-- assert ok`                  | the statement returned no error            |
-| `-- assert ()`                  | the statement returned no rows             |
-| `-- assert ({1, 10}, {2, 20})`  | the rows match exactly, no order           |
-
-Alternatives can be chained with ` or ` and the assertion holds if any of
-them matches — useful when a step is allowed to either succeed with a
-specific result or fail with an error depending on the isolation level:
-
-```sql
-t1: select * from test;  -- assert ({1, 12}, {2, 22}) or ({1, 11}, {2, 21})
-t2: commit;              -- assert ok or error
-```
-
-Anything after a `#` in the assert expression is treated as a free-text
-note and discarded:
-
-```sql
-t2: select * from test;  -- assert ({1, 11}, {2, 20}) or ({1, 10}, {2, 20})  # latter under SI
-```
-
-## Group invariants
-
-Tag related steps with `-- group <name>` and monastery emits a
-synthetic check row after the run. There are two modes, picked
-automatically:
-
-### Error mode (no labeled assertions in the group)
-
-Per-step assertions hard-code which transaction the engine must abort.
-That works for SSI (deterministic victim by commit order) but breaks on
-S2PL implementations that resolve cycles via deadlock detection and may
-pick a different victim. To assert "*some* transaction in this cycle
-must abort, but I don't care which", tag each candidate step:
-
-```sql
-t1: update test set value = 0 where id = 1;          -- group cycle1
-t2: update test set value = value + 5 where id = 2;  -- group cycle1
-```
-
-The check passes when at least one tagged step errored. The synthetic
-row reads `group: at least one error`.
-
-### Schedule mode (labeled `=>` branches)
-
-When the same hidden serial order should govern several reads, label
-each `or` branch with a short identifier and tag the reads with the
-same group:
-
-```sql
-t1: update test set value = 11 where id = 1;
-t2: update test set value = 12 where id = 1;
-t1: commit;
-t1: select * from test; -- group final; assert t2committed => ({1, 12}, {2, 22}) or t2aborted => ({1, 11}, {2, 21})
-t2: select * from test; -- group final; assert t2committed => ({1, 12}, {2, 22}) or t2aborted => ({1, 11}, {2, 21})
-```
-
-Each branch carries an arbitrary label naming a serial-equivalence
-class. Per-step status passes if any branch matches (same as today's
-`or`). The group additionally requires a single label to be feasible
-across all members — i.e., every member's matched branch set agrees on
-some L. Mixed outcomes (e.g. one read sees `t2committed`, the other
-sees `t2aborted`) fail the group as `no consistent schedule`.
-
-Unlabeled `or` branches act as wildcards for the group check. Members
-without an `assert` directive (e.g. `commit;`) are unconstrained. Pick
-the mode that fits the invariant: schedule mode catches torn views
-across multiple reads; error mode is for non-deterministic abort
-victims.
-
-### Composing
-
-`group` and `assert` are composable, separated by `;`:
-
-```sql
-t1: commit; -- assert ok; group cycle1
-```
-
-Group checks are skipped when the run is interrupted (Ctrl-C), since a
-missing member would spuriously fail the invariant.
-
-## Per-driver script overrides
-
-Some anomalies surface differently under SI/SSI vs. lock-based
-serializable, and the right assertion depends on the engine. When
-loading `foo.sql`, monastery first looks for `foo.sql.<driver>` (e.g.
-`foo.sql.mysql`) and uses that file if it exists. The actual path
-loaded is recorded in the `session_start` event's `script` field.
-
-`run-hermitage.sh` doesn't need any changes — its `*.sql` glob won't
-match `*.sql.<driver>`, but the Go runner does the resolution.
-
 ## Hermitage results
 
 ### Postgres
@@ -291,3 +191,103 @@ Jepsen does a good job of talking about the differences between these two classi
 | Read Committed   | Not Possible          | Not Possible                | Possible                          | Possible                  | Possible          | Possible                   | Possible                   |
 | Repeatable Read  | Not Possible          | Not Possible                | Not Possible                      | Not Possible              | Possible          | Not Possible               | Not Possible               |
 | Serializable     | Not Possible          | Not Possible                | Not Possible                      | Not Possible              | Not Possible      | Not Possible               | Not Possible               |
+
+## Assertions
+
+Each step can carry an `assert` after a `--`. The result is shown in the
+`ASSERT` column (green when it holds, red when it doesn't), and `monastery`
+exits non-zero if any assertion fails.
+
+| Form                            | Passes when                                |
+|---------------------------------|--------------------------------------------|
+| `-- assert error`               | the statement returned an error            |
+| `-- assert ok`                  | the statement returned no error            |
+| `-- assert ()`                  | the statement returned no rows             |
+| `-- assert ({1, 10}, {2, 20})`  | the rows match exactly, no order           |
+
+Alternatives can be chained with ` or ` and the assertion holds if any of
+them matches — useful when a step is allowed to either succeed with a
+specific result or fail with an error depending on the isolation level:
+
+```sql
+t1: select * from test;  -- assert ({1, 12}, {2, 22}) or ({1, 11}, {2, 21})
+t2: commit;              -- assert ok or error
+```
+
+Anything after a `#` in the assert expression is treated as a free-text
+note and discarded:
+
+```sql
+t2: select * from test;  -- assert ({1, 11}, {2, 20}) or ({1, 10}, {2, 20})  # latter under SI
+```
+
+## Group invariants
+
+Tag related steps with `-- group <name>` and monastery emits a
+synthetic check row after the run. There are two modes, picked
+automatically:
+
+### Error mode (no labeled assertions in the group)
+
+Per-step assertions hard-code which transaction the engine must abort.
+That works for SSI (deterministic victim by commit order) but breaks on
+S2PL implementations that resolve cycles via deadlock detection and may
+pick a different victim. To assert "*some* transaction in this cycle
+must abort, but I don't care which", tag each candidate step:
+
+```sql
+t1: update test set value = 0 where id = 1;          -- group cycle1
+t2: update test set value = value + 5 where id = 2;  -- group cycle1
+```
+
+The check passes when at least one tagged step errored. The synthetic
+row reads `group: at least one error`.
+
+### Schedule mode (labeled `=>` branches)
+
+When the same hidden serial order should govern several reads, label
+each `or` branch with a short identifier and tag the reads with the
+same group:
+
+```sql
+t1: update test set value = 11 where id = 1;
+t2: update test set value = 12 where id = 1;
+t1: commit;
+t1: select * from test; -- group final; assert t2committed => ({1, 12}, {2, 22}) or t2aborted => ({1, 11}, {2, 21})
+t2: select * from test; -- group final; assert t2committed => ({1, 12}, {2, 22}) or t2aborted => ({1, 11}, {2, 21})
+```
+
+Each branch carries an arbitrary label naming a serial-equivalence
+class. Per-step status passes if any branch matches (same as today's
+`or`). The group additionally requires a single label to be feasible
+across all members — i.e., every member's matched branch set agrees on
+some L. Mixed outcomes (e.g. one read sees `t2committed`, the other
+sees `t2aborted`) fail the group as `no consistent schedule`.
+
+Unlabeled `or` branches act as wildcards for the group check. Members
+without an `assert` directive (e.g. `commit;`) are unconstrained. Pick
+the mode that fits the invariant: schedule mode catches torn views
+across multiple reads; error mode is for non-deterministic abort
+victims.
+
+### Composing
+
+`group` and `assert` are composable, separated by `;`:
+
+```sql
+t1: commit; -- assert ok; group cycle1
+```
+
+Group checks are skipped when the run is interrupted (Ctrl-C), since a
+missing member would spuriously fail the invariant.
+
+## Per-driver script overrides
+
+Some anomalies surface differently under SI/SSI vs. lock-based
+serializable, and the right assertion depends on the engine. When
+loading `foo.sql`, monastery first looks for `foo.sql.<driver>` (e.g.
+`foo.sql.mysql`) and uses that file if it exists. The actual path
+loaded is recorded in the `session_start` event's `script` field.
+
+`run-hermitage.sh` doesn't need any changes — its `*.sql` glob won't
+match `*.sql.<driver>`, but the Go runner does the resolution.
