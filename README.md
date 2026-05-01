@@ -80,16 +80,7 @@ $ ./run-hermitage.sh postgres 'host=localhost port=4000 sslmode=disable dbname=p
 | 02-g1a-aborted-reads-dirty-reads             | FAIL               | OK                 | OK                 | OK                 |
 | 03-g1b-intermediate-reads-dirty-reads        | FAIL               | OK                 | OK                 | OK                 |
 | 04-g1c-circular-information-flow-dirty-reads | FAIL               | OK                 | OK                 | OK                 |
-| 05-otv                                       | FAIL               | OK                 | OK                 | OK                 |
-| 06-pmp                                       | FAIL               | FAIL               | OK                 | OK                 |
-| 07-pmp-write-predicates                      | FAIL               | FAIL               | OK                 | OK                 |
-| 08-p4-lost-update                            | FAIL               | FAIL               | OK                 | OK                 |
-| 09-g-single-read-skew                        | FAIL               | FAIL               | OK                 | OK                 |
-| 10-g-single-write-predicate                  | FAIL               | FAIL               | OK                 | OK                 |
-| 11-g-single-predicate-read-skew              | FAIL               | FAIL               | OK                 | OK                 |
-| 12-g2-item-write-skew                        | FAIL               | FAIL               | FAIL               | OK                 |
-| 13-g2-predicate-read-write-skew              | FAIL               | FAIL               | FAIL               | OK                 |
-| 14-g2-predicate-read-fekete-write-skew       | FAIL               | FAIL               | FAIL               | OK                 |
+...
 ```
 
 Per-run JSONL logs and stdout/stderr land in `.hermitage-logs/` for inspection.
@@ -193,3 +184,53 @@ loaded is recorded in the `session_start` event's `script` field.
 
 `run-hermitage.sh` doesn't need any changes — its `*.sql` glob won't
 match `*.sql.<driver>`, but the Go runner does the resolution.
+
+## Hermitage results
+
+### Postgres
+
+```shell
+$ postgres --version
+postgres (PostgreSQL) 18.1 (Homebrew)
+$ ./run-hermitage.sh postgres 'host=localhost port=4000 sslmode=disable dbname=postgres'
+| Test                                         | Read Uncommitted   | Read Committed     | Repeatable Read    | Serializable       |
+|----------------------------------------------|--------------------|--------------------|--------------------|--------------------|
+| 01-g0-write-cycles-dirty-writes              | FAIL               | OK                 | OK                 | OK                 |
+| 02-g1a-aborted-reads-dirty-reads             | FAIL               | OK                 | OK                 | OK                 |
+| 03-g1b-intermediate-reads-dirty-reads        | FAIL               | OK                 | OK                 | OK                 |
+| 04-g1c-circular-information-flow-dirty-reads | FAIL               | OK                 | OK                 | OK                 |
+| 05-otv                                       | FAIL               | OK                 | OK                 | OK                 |
+| 06-pmp                                       | FAIL               | FAIL               | OK                 | OK                 |
+| 07-pmp-write-predicates                      | FAIL               | FAIL               | OK                 | OK                 |
+| 08-p4-lost-update                            | FAIL               | FAIL               | OK                 | OK                 |
+| 09-g-single-read-skew                        | FAIL               | FAIL               | OK                 | OK                 |
+| 10-g-single-write-predicate                  | FAIL               | FAIL               | OK                 | OK                 |
+| 11-g-single-predicate-read-skew              | FAIL               | FAIL               | OK                 | OK                 |
+| 12-g2-item-write-skew                        | FAIL               | FAIL               | FAIL               | OK                 |
+| 13-g2-predicate-read-write-skew              | FAIL               | FAIL               | FAIL               | OK                 |
+| 14-g2-predicate-read-fekete-write-skew       | FAIL               | FAIL               | FAIL               | OK                 |
+```
+
+### MySQL
+
+```
+$ mysql --version
+mysql  Ver 9.6.0 for macos15.7 on arm64 (Homebrew)
+$ ./run-hermitage.sh mysql "root@tcp(127.0.0.1:3306)/testdb"
+| Test                                         | Read Uncommitted   | Read Committed     | Repeatable Read    | Serializable       |
+|----------------------------------------------|--------------------|--------------------|--------------------|--------------------|
+| 01-g0-write-cycles-dirty-writes              | FAIL               | OK                 | OK                 | OK                 |
+| 02-g1a-aborted-reads-dirty-reads             | FAIL               | OK                 | OK                 | OK                 |
+| 03-g1b-intermediate-reads-dirty-reads        | FAIL               | OK                 | OK                 | OK                 |
+| 04-g1c-circular-information-flow-dirty-reads | FAIL               | OK                 | OK                 | OK                 |
+| 05-otv                                       | OK                 | OK                 | OK                 | OK                 |
+| 06-pmp                                       | FAIL               | FAIL               | OK                 | OK                 |
+| 07-pmp-write-predicates                      | OK                 | OK                 | OK                 | OK                 |
+| 08-p4-lost-update                            | FAIL               | FAIL               | FAIL               | OK                 |
+| 09-g-single-read-skew                        | FAIL               | FAIL               | OK                 | OK                 |
+| 10-g-single-write-predicate                  | FAIL               | FAIL               | FAIL               | OK                 |
+| 11-g-single-predicate-read-skew              | FAIL               | FAIL               | OK                 | OK                 |
+| 12-g2-item-write-skew                        | FAIL               | FAIL               | FAIL               | OK                 |
+| 13-g2-predicate-read-write-skew              | FAIL               | FAIL               | FAIL               | OK                 |
+| 14-g2-predicate-read-fekete-write-skew       | FAIL               | FAIL               | FAIL               | OK                 |
+```
