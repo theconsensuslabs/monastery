@@ -327,16 +327,21 @@ func contentBounds(h, total int, dumping bool) (top, bottom, visible int) {
 	return
 }
 
+func (sc *screen) maxScroll() int {
+	_, h := sc.s.Size()
+	total := sc.totalContentLines()
+	_, _, visible := contentBounds(h, total, sc.dumping)
+	m := total - visible
+	if m < 0 {
+		m = 0
+	}
+	return m
+}
+
 func (sc *screen) scroll(delta int) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	_, h := sc.s.Size()
-	total := sc.totalContentLines()
-	_, _, visible := contentBounds(h, total, false)
-	maxScroll := total - visible
-	if maxScroll < 0 {
-		maxScroll = 0
-	}
+	maxScroll := sc.maxScroll()
 	sc.scrollOffset += delta
 	if sc.scrollOffset < 0 {
 		sc.scrollOffset = 0
@@ -549,8 +554,12 @@ func (sc *screen) addRow(r rowData) int {
 	}
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	atBottom := sc.scrollOffset >= sc.maxScroll()
 	idx := len(sc.rows)
 	sc.rows = append(sc.rows, r)
+	if atBottom {
+		sc.scrollOffset = sc.maxScroll()
+	}
 	sc.redrawAll()
 	return idx
 }
@@ -564,7 +573,11 @@ func (sc *screen) updateRow(idx int, r rowData) {
 	if idx >= len(sc.rows) {
 		return
 	}
+	atBottom := sc.scrollOffset >= sc.maxScroll()
 	sc.rows[idx] = r
+	if atBottom {
+		sc.scrollOffset = sc.maxScroll()
+	}
 	sc.redrawAll()
 }
 
