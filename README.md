@@ -2,6 +2,8 @@
 
 A tool for testing and observing transaction behavior.
 
+![demo](./postgres-dirty-writes.gif)
+
 ```
 $ git clone https://github.com/theconsensuslabs/monastery
 $ cd monastery
