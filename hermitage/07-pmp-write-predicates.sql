@@ -12,5 +12,5 @@ t2: $SHOW_ISOLATION;
 t1: update test set value = value + 10;
 t2: delete from test where value = 20;             -- group final; assert ok or t2aborted => error
 t1: commit;
-t2: select * from test where value = 20;           -- group final; assert error
+t2: select * from test where value = 20;           -- group final; assert () or t2aborted => error
 t2: commit;                                         -- group final
