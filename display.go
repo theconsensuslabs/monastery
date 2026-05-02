@@ -201,6 +201,39 @@ type screen struct {
 	dump         string
 }
 
+// markdownDump renders the accumulated rows as a GitHub-flavored markdown
+// table. Pipes inside a cell are escaped, and newlines (from multi-line SQL
+// or wrapped errors) become "<br>" since markdown table cells are single-line.
+func (sc *screen) markdownDump() string {
+	escape := func(s string) string {
+		s = strings.ReplaceAll(s, "|", "\\|")
+		s = strings.ReplaceAll(s, "\r\n", "\n")
+		s = strings.ReplaceAll(s, "\n", "<br>")
+		return s
+	}
+	var sb strings.Builder
+	sb.WriteString("|")
+	for _, h := range colHeaders {
+		sb.WriteString(" " + h + " |")
+	}
+	sb.WriteString("\n|")
+	for range colHeaders {
+		sb.WriteString(" --- |")
+	}
+	sb.WriteString("\n")
+	for _, r := range sc.rows {
+		fields := [numCols]string{
+			r.client, r.command, r.start, r.end, r.results, r.err, formatAssertCell(r),
+		}
+		sb.WriteString("|")
+		for _, f := range fields {
+			sb.WriteString(" " + escape(f) + " |")
+		}
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
 func (sc *screen) captureDump() string {
 	w, h := sc.s.Size()
 	var sb strings.Builder

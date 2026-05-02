@@ -864,16 +864,18 @@ func run() error {
 	interval := flag.Duration("interval", 300*time.Millisecond, "delay between dispatching each step (e.g. 500ms, 1s, 1m)")
 	interactive := flag.Bool("interactive", false, "wait for any keypress before dispatching each step")
 	eventsOnly := flag.Bool("events-only", false, "skip the TUI and stream JSON events to stdout")
+	markdown := flag.Bool("markdown", false, "emit the final result as a markdown table instead of the box-drawn table")
 	logPath := flag.String("log", "monastery.jsonl", "path to JSON log file")
 	pluginDir := flag.String("plugin-dir", defaultPluginDir(), "directory containing driver plugin .so files")
 	flag.Parse()
 
 	args := flag.Args()
 	if len(args) < 4 {
-		return errors.New("usage: monastery [-interval <duration>] [-interactive] [-events-only] [-log <path>] <driver> <dsn> <isolation level> <script>\n" +
+		return errors.New("usage: monastery [-interval <duration>] [-interactive] [-events-only] [-markdown] [-log <path>] <driver> <dsn> <isolation level> <script>\n" +
 			"  -interval duration  delay between steps (default 3s, e.g. 500ms, 1m)\n" +
 			"  -interactive        wait for keypress before each step instead of using interval\n" +
 			"  -events-only        skip the TUI and stream JSON events to stdout\n" +
+			"  -markdown           emit the final result as a markdown table instead of the box-drawn table\n" +
 			"  -log path           json log file (default monastery.jsonl)\n" +
 			"  isolation levels: read-uncommitted, read-committed, repeatable-read, serializable\n" +
 			"  drivers: mysql, postgres (loaded from <driver>.so plugin)\n" +
@@ -971,16 +973,21 @@ func run() error {
 		}
 		defer func() {
 			sc.mu.Lock()
-			if sc.dump == "" {
-				sc.dumping = true
-				sc.redrawAll()
-				sc.dump = sc.captureDump()
+			var output string
+			if *markdown {
+				output = sc.markdownDump()
+			} else {
+				if sc.dump == "" {
+					sc.dumping = true
+					sc.redrawAll()
+					sc.dump = sc.captureDump()
+				}
+				output = sc.dump
 			}
-			dump := sc.dump
 			sc.mu.Unlock()
 			sc.fini()
-			if dump != "" {
-				fmt.Print(dump)
+			if output != "" {
+				fmt.Print(output)
 			}
 			fmt.Println(runID)
 		}()
