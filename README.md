@@ -10,10 +10,6 @@ $ go build -buildmode=plugin -o mysql.so ./plugins/mysql/ # Optional, for MariaD
 $ go build
 ```
 
-There are builtin scripts that use
-[Hermitage](https://github.com/ept/hermitage) test cases in
-[./hermitage](./hermitage)`.
-
 For example to test the behavior of [Dirty Writes](https://jepsen.io/consistency/phenomena/p0)
 in PostgreSQL at the repeatable-read isolation level.
 
@@ -106,14 +102,17 @@ $ ./monastery -events-only postgres 'host=localhost port=4000 sslmode=disable db
 
 You can slow down the run using `-interactive` to trigger each event one-by-one or run with `-interval .05s` to go slowly.
 
-## Running the full hermitage suite
+## Hermitage
 
-`run-hermitage.sh` runs every script in `hermitage/` against every isolation
-level in lexicographical order and prints a summary table:
+There are builtin scripts that use
+[Hermitage](https://github.com/ept/hermitage) test cases in
+[./hermitage](./hermitage).
+
+`run-hermitage.sh` runs every script in `hermitage/` against every
+isolation level and prints a summary table:
 
 ```shell
 $ ./run-hermitage.sh postgres 'host=localhost port=4000 sslmode=disable dbname=postgres'
-./run-hermitage.sh postgres 'host=localhost port=4000 sslmode=disable dbname=postgres'
 | Test                                         | Read Uncommitted   | Read Committed     | Repeatable Read    | Serializable       |
 |----------------------------------------------|--------------------|--------------------|--------------------|--------------------|
 | 01-g0-write-cycles-dirty-writes              | FAIL               | OK                 | OK                 | OK                 |
