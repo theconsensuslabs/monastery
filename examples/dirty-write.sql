@@ -10,8 +10,8 @@ t1: UPDATE shoes SET left_shoe = 'Lin' WHERE shoe_id = 1;
 t2: UPDATE shoes SET left_shoe = 'Carlos' WHERE shoe_id = 1; -- group final; assert t2committed => ok or t2aborted => error
 t2: UPDATE shoes SET right_shoe = 'Carlos' WHERE shoe_id = 1; -- group final; assert t2committed => ok or t2aborted => error
 t1: UPDATE shoes SET right_shoe = 'Lin' WHERE shoe_id = 1;
-t1: SELECT * FROM shoes; -- assert ({Lin, Lin, 1})
-t2: SELECT * FROM shoes; -- group final; assert t2committed => ({Carlos, Carlos, 1}) or t2aborted => error
+t1: SELECT * FROM shoes; -- assert ({Lin, Lin, 1}) # MUST NOT BE A MIX OF Lin AND Carlos!!
+t2: SELECT * FROM shoes; -- group final; assert t2committed => ({Carlos, Carlos, 1}) or t2aborted => error  # MUST NOT BE A MIX OF Lin AND Carlos!!
 t1: COMMIT;
 t2: COMMIT;
 t1: SELECT * FROM shoes; -- assert ({Lin, Lin, 1}) or ({Carlos, Carlos, 1})

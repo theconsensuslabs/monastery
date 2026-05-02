@@ -2,54 +2,94 @@
 
 A tool for testing and observing transaction behavior.
 
+```
+$ git clone https://github.com/theconsensuslabs/monastery
+$ cd monastery
+$ go build -buildmode=plugin -o postgres.so ./plugins/postgres/ # Optional, for Postgres.
+$ go build -buildmode=plugin -o mysql.so ./plugins/mysql/ # Optional, for MariaDB or MySQL.
+$ go build
+```
+
 There are builtin scripts that use
 [Hermitage](https://github.com/ept/hermitage) test cases in
 [./hermitage](./hermitage)`.
 
-For example to test the behavior of Predicate-Many-Preceders (PMP) for
-write predicates in PostgreSQL at the repeatable-read isolation level.
+For example to test the behavior of [Dirty Writes](https://jepsen.io/consistency/phenomena/p0)
+in PostgreSQL at the repeatable-read isolation level.
+
+```sql
+$ cat examples/dirty-write.sql
+DROP TABLE IF EXISTS shoes;
+CREATE TABLE shoes (left_shoe TEXT, right_shoe TEXT, shoe_id INT PRIMARY KEY);
+INSERT INTO shoes VALUES ('', '', 1);
+
+---
+
+t1: BEGIN;
+t2: BEGIN;
+t1: UPDATE shoes SET left_shoe = 'Lin' WHERE shoe_id = 1;
+t2: UPDATE shoes SET left_shoe = 'Carlos' WHERE shoe_id = 1; -- group final; assert t2committed => ok or t2aborted => error
+t2: UPDATE shoes SET right_shoe = 'Carlos' WHERE shoe_id = 1; -- group final; assert t2committed => ok or t2aborted => error
+t1: UPDATE shoes SET right_shoe = 'Lin' WHERE shoe_id = 1;
+t1: SELECT * FROM shoes; -- assert ({Lin, Lin, 1}) # MUST NOT BE A MIX OF Lin AND Carlos!!
+t2: SELECT * FROM shoes; -- group final; assert t2committed => ({Carlos, Carlos, 1}) or t2aborted => error  # MUST NOT BE A MIX OF Lin AND Carlos!!
+t1: COMMIT;
+t2: COMMIT;
+t1: SELECT * FROM shoes; -- assert ({Lin, Lin, 1}) or ({Carlos, Carlos, 1})
+t2: SELECT * FROM shoes; -- assert ({Lin, Lin, 1}) or ({Carlos, Carlos, 1})
+```
+
+Start up Postgres.
 
 ```shell
 $ initdb testdb
 $ postgres -D testdb -p 4000
 ```
 
-In another terminal.
+And in another run Monastery against Postgres and this script.
 
 ```shell
-$ git clone https://github.com/theconsensuslabs/monastery
-$ cd monastery
-$ go build -buildmode=plugin -o postgres.so ./plugins/postgres/
-$ go build
-$ ./monastery postgres 'host=localhost port=4000 sslmode=disable dbname=postgres' repeatable-read hermitage/06-pmp.sql
+$ ./monastery postgres 'host=localhost port=4000 sslmode=disable dbname=postgres' repeatable-read examples/dirty-write.sql
 ┌──────────┬────────────────────────────────────────────────────────────┬──────────────┬──────────────┬────────────────────┬────────────────────────────────────────┬──────────────────────────────────────────────────┐
 │CLIENT    │COMMAND                                                     │STARTED       │ENDED         │RESULTS             │ERROR                                   │ASSERT                                            │
 ╞──────────╪────────────────────────────────────────────────────────────╪──────────────╪──────────────╪────────────────────╪────────────────────────────────────────╪──────────────────────────────────────────────────╡
-│setup     │drop table if exists test;                                  │10:05:37.339  │10:05:37.340  │                    │                                        │                                                  │
+│setup     │DROP TABLE IF EXISTS shoes;                                 │17:43:02.732  │17:43:02.735  │                    │                                        │                                                  │
 ├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
-│setup     │create table test (id int primary key, value int);          │10:05:37.340  │10:05:37.342  │                    │                                        │                                                  │
+│setup     │CREATE TABLE shoes (left_shoe TEXT, right_shoe TEXT, shoe_id│17:43:02.736  │17:43:02.738  │                    │                                        │                                                  │
+│          │INT PRIMARY KEY);                                           │              │              │                    │                                        │                                                  │
 ├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
-│setup     │insert into test (id, value) values (1, 10), (2, 20);       │10:05:37.343  │10:05:37.344  │                    │                                        │                                                  │
+│setup     │INSERT INTO shoes VALUES ('', '', 1);                       │17:43:02.738  │17:43:02.739  │                    │                                        │                                                  │
 ├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
-│t1        │begin;                                                      │10:05:37.346  │10:05:37.346  │                    │                                        │                                                  │
+│t1        │BEGIN;                                                      │17:43:02.741  │17:43:02.742  │()                  │                                        │                                                  │
 ├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
-│t1        │SHOW transaction_isolation;                                 │10:05:37.647  │10:05:37.650  │{repeatable read}   │                                        │                                                  │
+│t2        │BEGIN;                                                      │17:43:03.042  │17:43:03.047  │()                  │                                        │                                                  │
 ├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
-│t2        │begin;                                                      │10:05:37.947  │10:05:37.952  │                    │                                        │                                                  │
+│t1        │UPDATE shoes SET left_shoe = 'Lin' WHERE shoe_id = 1;       │17:43:03.342  │17:43:03.350  │()                  │                                        │                                                  │
 ├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
-│t2        │SHOW transaction_isolation;                                 │10:05:38.247  │10:05:38.253  │{repeatable read}   │                                        │                                                  │
+│t2        │UPDATE shoes SET left_shoe = 'Carlos' WHERE shoe_id = 1;    │17:43:03.642  │17:43:05.150  │                    │pq: could not serialize access due to   │OK t2committed => ok or t2aborted => error        │
+│          │                                                            │              │              │                    │concurrent update (40001)               │                                                  │
 ├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
-│t1        │select * from test where value = 30;                        │10:05:38.546  │10:05:38.554  │                    │                                        │                                                  │
+│t1        │UPDATE shoes SET right_shoe = 'Lin' WHERE shoe_id = 1;      │17:43:04.242  │17:43:04.248  │()                  │                                        │                                                  │
 ├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
-│t2        │insert into test (id, value) values(3, 30);                 │10:05:38.847  │10:05:38.853  │                    │                                        │                                                  │
+│t1        │SELECT * FROM shoes;                                        │17:43:04.542  │17:43:04.549  │({Lin, Lin, 1})     │                                        │OK ({Lin, Lin, 1})                                │
 ├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
-│t2        │commit;                                                     │10:05:39.147  │10:05:39.152  │                    │                                        │                                                  │
+│t1        │COMMIT;                                                     │17:43:05.142  │17:43:05.150  │()                  │                                        │                                                  │
 ├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
-│t1        │select * from test where value % 3 = 0;                     │10:05:39.447  │10:05:39.454  │                    │                                        │OK ()                                             │
+│t2        │UPDATE shoes SET right_shoe = 'Carlos' WHERE shoe_id = 1;   │17:43:05.158  │17:43:05.162  │                    │current transaction is aborted,         │OK t2committed => ok or t2aborted => error        │
+│          │                                                            │              │              │                    │statement ignored                       │                                                  │
 ├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
-│t1        │commit;                                                     │10:05:39.747  │10:05:39.754  │                    │                                        │                                                  │
+│t2        │SELECT * FROM shoes;                                        │17:43:05.166  │17:43:05.169  │                    │current transaction is aborted,         │OK t2committed => ({Carlos, Carlos, 1}) or        │
+│          │                                                            │              │              │                    │statement ignored                       │t2aborted => error                                │
+├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
+│t2        │COMMIT;                                                     │17:43:05.442  │17:43:05.452  │()                  │                                        │                                                  │
+├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
+│t1        │SELECT * FROM shoes;                                        │17:43:05.742  │17:43:05.749  │({Lin, Lin, 1})     │                                        │OK ({Lin, Lin, 1}) or ({Carlos, Carlos, 1})       │
+├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
+│t2        │SELECT * FROM shoes;                                        │17:43:06.042  │17:43:06.048  │({Lin, Lin, 1})     │                                        │OK ({Lin, Lin, 1}) or ({Carlos, Carlos, 1})       │
+├──────────┼────────────────────────────────────────────────────────────┼──────────────┼──────────────┼────────────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
+│final     │schedule: {t2aborted}                                       │              │              │                    │                                        │OK group: consistent schedule across {t2aborted,  │
+│          │                                                            │              │              │                    │                                        │t2committed}                                      │
 └──────────┴────────────────────────────────────────────────────────────┴──────────────┴──────────────┴────────────────────┴────────────────────────────────────────┴──────────────────────────────────────────────────┘
-5dd71860-a896-485f-be0f-c599885dfda9
 ```
 
 These events also get emitted to `monastery.jsonl`. You can filter them for a run by the uuid above.
