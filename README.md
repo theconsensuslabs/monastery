@@ -1,6 +1,6 @@
 # Monastery
 
-A tool for testing and observing transaction behavior.
+A tool for testing and observing transaction behavior. [Read the article](https://theconsensus.dev/p/2026/05/02/automating-hermitage.html) on The Consensus.
 
 ![demo](./postgres-dirty-writes.gif)
 
