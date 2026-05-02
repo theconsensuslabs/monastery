@@ -169,7 +169,7 @@ Produces:
 
 | Test                                         | Read Uncommitted   | Read Committed     | Repeatable Read    | Serializable       |
 |----------------------------------------------|--------------------|--------------------|--------------------|--------------------|
-| 01-g0-write-cycles-dirty-writes              | FAIL               | OK                 | OK                 | OK                 |
+| 01-g0-write-cycles-dirty-writes              | OK                 | OK                 | OK                 | OK                 |
 | 02-g1a-aborted-reads-dirty-reads             | FAIL               | OK                 | OK                 | OK                 |
 | 03-g1b-intermediate-reads-dirty-reads        | FAIL               | OK                 | OK                 | OK                 |
 | 04-g1c-circular-information-flow-dirty-reads | FAIL               | OK                 | OK                 | OK                 |
@@ -197,7 +197,7 @@ Produces:
 
 | Test                                         | Read Uncommitted   | Read Committed     | Repeatable Read    | Serializable       |
 |----------------------------------------------|--------------------|--------------------|--------------------|--------------------|
-| 01-g0-write-cycles-dirty-writes              | FAIL               | OK                 | OK                 | OK                 |
+| 01-g0-write-cycles-dirty-writes              | OK                 | OK                 | OK                 | OK                 |
 | 02-g1a-aborted-reads-dirty-reads             | FAIL               | OK                 | OK                 | OK                 |
 | 03-g1b-intermediate-reads-dirty-reads        | FAIL               | OK                 | OK                 | OK                 |
 | 04-g1c-circular-information-flow-dirty-reads | FAIL               | OK                 | OK                 | OK                 |
@@ -211,7 +211,6 @@ Produces:
 | 12-g2-item-write-skew                        | FAIL               | FAIL               | FAIL               | OK                 |
 | 13-g2-predicate-read-write-skew              | FAIL               | FAIL               | FAIL               | OK                 |
 | 14-g2-predicate-read-fekete-write-skew       | FAIL               | FAIL               | FAIL               | OK                 |
-
 
 ## Expected behavior
 
