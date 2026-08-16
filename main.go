@@ -845,6 +845,146 @@ func evalScheduleGroup(name string, members []groupMember, universe map[string]b
 	}
 }
 
+// failureTracker counts failed assertions by client, assertion text, and
+// the error that caused them. A concurrent run has no interleaving worth
+// replaying, so what broke and how often is the whole result.
+//
+// The error is part of the identity because an assertion that failed on a
+// statement error says something different from one that failed on the
+// rows that came back. Only the second is a claim about the engine's
+// behavior; the first says the statement never ran.
+type failureTracker struct {
+	mu     sync.Mutex
+	counts map[[3]string]*failEntry
+}
+
+const (
+	// errWidth and gotWidth bound the reported error and result, either of
+	// which can be long enough to swamp the rest of the line.
+	errWidth = 60
+	gotWidth = 40
+	// maxSamples caps the distinct results held per failing assertion.
+	maxSamples = 1000
+)
+
+// failEntry counts one failing assertion and the distinct results behind it.
+type failEntry struct {
+	count   int
+	samples map[string]int
+}
+
+// got returns the most common result, with a note of how many other
+// distinct ones were seen.
+func (e *failEntry) got() string {
+	if len(e.samples) == 0 {
+		return ""
+	}
+	best, bestN := "", -1
+	for sample, n := range e.samples {
+		if n > bestN || (n == bestN && sample < best) {
+			best, bestN = sample, n
+		}
+	}
+	out := truncate(best, gotWidth)
+	if len(e.samples) > 1 {
+		out += fmt.Sprintf(" +%d more", len(e.samples)-1)
+	}
+	return out
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-3] + "..."
+}
+
+func newFailureTracker() *failureTracker {
+	return &failureTracker{counts: map[[3]string]*failEntry{}}
+}
+
+func (f *failureTracker) record(client, assert string, runErr error, rows [][]any) {
+	text := ""
+	if runErr != nil {
+		text = truncate(runErr.Error(), errWidth)
+	}
+	key := [3]string{client, assert, text}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	entry := f.counts[key]
+	if entry == nil {
+		entry = &failEntry{samples: map[string]int{}}
+		f.counts[key] = entry
+	}
+	entry.count++
+	// An errored step returned nothing, so there is no result to sample.
+	if runErr != nil {
+		return
+	}
+	got := formatRows(rows)
+	if _, seen := entry.samples[got]; seen || len(entry.samples) < maxSamples {
+		entry.samples[got]++
+	}
+}
+
+// summary renders one line per distinct failing assertion, most frequent
+// first.
+func (f *failureTracker) summary() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.counts) == 0 {
+		return "no assertion failures\n"
+	}
+	type row struct {
+		client, assert, got, err string
+		count                    int
+	}
+	rows := make([]row, 0, len(f.counts))
+	for key, entry := range f.counts {
+		rows = append(rows, row{key[0], key[1], entry.got(), key[2], entry.count})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].count != rows[j].count {
+			return rows[i].count > rows[j].count
+		}
+		if rows[i].client != rows[j].client {
+			return rows[i].client < rows[j].client
+		}
+		return rows[i].assert < rows[j].assert
+	})
+	countWidth, clientWidth := len("COUNT"), len("CLIENT")
+	assertWidth, gotColWidth := len("ASSERTION"), len("GOT")
+	anyErr, anyGot := false, false
+	for _, r := range rows {
+		countWidth = max(countWidth, len(strconv.Itoa(r.count)))
+		clientWidth = max(clientWidth, len(r.client))
+		assertWidth = max(assertWidth, len(r.assert))
+		gotColWidth = max(gotColWidth, len(r.got))
+		anyErr = anyErr || r.err != ""
+		anyGot = anyGot || r.got != ""
+	}
+	var b strings.Builder
+	header := fmt.Sprintf("%*s  %-*s  %-*s", countWidth, "COUNT", clientWidth, "CLIENT", assertWidth, "ASSERTION")
+	if anyGot {
+		header += fmt.Sprintf("  %-*s", gotColWidth, "GOT")
+	}
+	if anyErr {
+		header += "  ERROR"
+	}
+	fmt.Fprintln(&b, strings.TrimRight(header, " "))
+	for _, r := range rows {
+		line := fmt.Sprintf("%*d  %-*s  %-*s", countWidth, r.count, clientWidth, r.client, assertWidth, r.assert)
+		if anyGot {
+			line += fmt.Sprintf("  %-*s", gotColWidth, r.got)
+		}
+		if r.err != "" {
+			line += "  " + r.err
+		}
+		fmt.Fprintln(&b, strings.TrimRight(line, " "))
+	}
+	return b.String()
+}
+
 func sortedKeys(m map[string]bool) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -917,7 +1057,7 @@ func bindLiteral(v any) string {
 	}
 }
 
-func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, sc *screen, lg *logger, failures *atomic.Int64, groups *groupTracker) {
+func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, sc *screen, lg *logger, failures *atomic.Int64, groups *groupTracker, fails *failureTracker) {
 	var inTxn, txnAborted bool
 	// Bindings are per-client: two clients running the same script text
 	// each keep their own `a`, `b`, and so on.
@@ -1079,6 +1219,7 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 			event["assert_status"] = status
 			if status == "FAIL" {
 				failures.Add(1)
+				fails.record(id, s.assert.raw, runErr, resultRows)
 			}
 		}
 		if scored {
@@ -1285,11 +1426,11 @@ func run() error {
 	}
 
 	// A concurrent run has no interleaving to watch and enough steps to
-	// overwhelm the table, so it defaults to streaming events. An explicit
-	// -events-only=false still gets the TUI.
-	if concurrent && !flagWasSet("events-only") {
-		*eventsOnly = true
-	}
+	// overwhelm both the table and a reader, so by default it prints only
+	// the counts of failing assertions. Every step is still written to the
+	// log file. -events-only streams the steps, -events-only=false forces
+	// the table.
+	summaryOnly := concurrent && !flagWasSet("events-only")
 
 	for i, p := range preconditions {
 		preconditions[i] = strings.ReplaceAll(p, "$SHOW_ISOLATION", showSQL)
@@ -1325,7 +1466,7 @@ func run() error {
 	})
 
 	var sc *screen
-	if !*eventsOnly {
+	if !*eventsOnly && !summaryOnly {
 		sc, err = newScreen()
 		if err != nil {
 			return err
@@ -1387,6 +1528,7 @@ func run() error {
 
 	var failures atomic.Int64
 	groups := newGroupTracker()
+	fails := newFailureTracker()
 	clientChans := map[string]chan step{}
 	var wg sync.WaitGroup
 
@@ -1424,7 +1566,7 @@ func run() error {
 			wg.Add(1)
 			go func(id string, c *sql.Conn, ch chan step) {
 				defer wg.Done()
-				clientWork(ctx, id, c, ch, sc, lg, &failures, groups)
+				clientWork(ctx, id, c, ch, sc, lg, &failures, groups, fails)
 			}(s.clientID, conn, ch)
 		}
 	}
@@ -1493,7 +1635,7 @@ func run() error {
 		checkWG.Add(1)
 		go func() {
 			defer checkWG.Done()
-			clientWork(ctx, "check", conn, ch, sc, lg, &failures, groups)
+			clientWork(ctx, "check", conn, ch, sc, lg, &failures, groups, fails)
 		}()
 		for _, s := range checks {
 			ch <- s
@@ -1518,6 +1660,11 @@ func run() error {
 		sessionEnd["reason"] = "interrupted"
 	}
 	lg.write(sessionEnd)
+
+	if summaryOnly {
+		fmt.Print(fails.summary())
+		fmt.Println(runID)
+	}
 
 	failErr := func() error {
 		if failed > 0 {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -230,6 +231,45 @@ func TestAssertSum(t *testing.T) {
 		if _, err := parseAssert(bad); err == nil {
 			t.Errorf("parseAssert(%q): want error, got nil", bad)
 		}
+	}
+}
+
+func TestFailureSummary(t *testing.T) {
+	f := newFailureTracker()
+	if got := f.summary(); got != "no assertion failures\n" {
+		t.Errorf("empty summary = %q", got)
+	}
+	// Same assertion, three distinct results, plus one that never ran.
+	f.record("r1", "sum(0) = 2000", nil, [][]any{{int64(1788)}, {int64(211)}})
+	f.record("r1", "sum(0) = 2000", nil, [][]any{{int64(1466)}, {int64(535)}})
+	f.record("r1", "sum(0) = 2000", nil, [][]any{{int64(1466)}, {int64(535)}})
+	f.record("r1", "sum(0) = 2000", errors.New("read timed out"), nil)
+	f.record("check", "({600})", nil, [][]any{{int64(798)}})
+
+	got := f.summary()
+	lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("summary has %d lines, want header + 3:\n%s", len(lines), got)
+	}
+	if !strings.Contains(lines[0], "COUNT") || !strings.Contains(lines[0], "GOT") ||
+		!strings.Contains(lines[0], "ERROR") {
+		t.Errorf("header missing columns: %q", lines[0])
+	}
+	// Most frequent result wins the GOT column, and the other distinct one
+	// is counted rather than printed.
+	if !strings.Contains(lines[1], "({1466}, {535}) +1 more") {
+		t.Errorf("row 1 lost its sample: %q", lines[1])
+	}
+	// An errored failure is its own row and carries no result.
+	errRow := lines[2]
+	if !strings.Contains(errRow, "read timed out") {
+		errRow = lines[3]
+	}
+	if !strings.Contains(errRow, "read timed out") {
+		t.Fatalf("no row carried the error:\n%s", got)
+	}
+	if strings.Contains(errRow, "{") {
+		t.Errorf("errored row should have no result: %q", errRow)
 	}
 }
 

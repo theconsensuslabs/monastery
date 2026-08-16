@@ -351,9 +351,25 @@ separator `--- concurrent` releases the clients to run at their own
 speed instead of stepping through one global order, and anything after
 the second separator runs once, after every client has finished.
 
-With no interleaving to watch and enough steps to overwhelm the table,
-a concurrent run defaults to `-events-only` output. Pass
-`-events-only=false` to get the TUI anyway.
+With no interleaving to watch and enough steps to overwhelm a reader, a
+concurrent run prints only the counts of failing assertions:
+
+```
+COUNT  CLIENT  ASSERTION      GOT                        ERROR
+  714  r1      sum(0) = 2000  ({799}, {1202}) +200 more
+   19  r1      sum(0) = 2000                             CAS operation result is unknown ...
+    1  check   ({600})        ({799})
+```
+
+`GOT` carries the most common result behind those failures, and counts
+the other distinct ones rather than printing them. An assertion that
+failed because the statement errored is a separate row with no result,
+since a statement that never ran says nothing about how the engine
+behaved.
+
+Every step still goes to the log file, so `-log` plus `jq` recovers the
+detail behind any count. Pass `-events-only` to stream the steps to
+stdout instead, or `-events-only=false` to force the table.
 
 For example:
 
@@ -427,11 +443,23 @@ match `*.sql.<driver>`, but the Go runner does the resolution.
 
 ## Cassandra
 
-`cassandra/` holds a same money-transfer workload written four ways
-(`plain`, `batch`, `lwt`, `accord`), each in a `-same` and a `-cross`
-variant, for a pair of accounts that share a partition and a pair that
-does not. Every script runs two writers and one reader against one pair
-and measures atomicity, lost updates, and isolation.
+`cassandra/` holds a money-transfer workload written four ways (`plain`,
+`batch`, `lwt`, `accord`), each in a `-same` and a `-cross` variant, for
+a pair of accounts that share a partition and a pair that does not.
+Every script runs two writers and one reader against one pair.
+
+The unprefixed scripts transfer by read-modify-write, which is what CQL
+forces on an application that wants to move a value, and they measure
+lost updates. Because the reads sit outside whatever the writes are
+wrapped in, a stale read can also break conservation durably, after
+which the reader keeps reporting a state that went wrong long before it
+looked.
+
+The `bare-` scripts remove that. Each writer sends a self-consistent
+pair totalling 2000, taking the amount from the loop variable and
+letting CQL compute the complement, so nothing is read and no update can
+be lost. What the reader sees then measures atomicity and isolation
+alone.
 
 ```
 ./monastery cql '127.0.0.1,127.0.0.2?consistency=quorum&timeout=30s' cassandra/accord-cross.sql
