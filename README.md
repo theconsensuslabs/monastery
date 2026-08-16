@@ -414,6 +414,23 @@ A step's assertion, where it has one, is what decides whether the block
 succeeded. `-- assert error` on a statement the engine is supposed to
 reject therefore ends the block rather than retrying it. Blocks nest.
 
+### Line continuation
+
+A line ending in `\` continues onto the next one, which keeps a long
+statement readable:
+
+```sql
+w1: begin batch \
+      update accounts set balance = {x} where id = 1; \
+      update accounts set balance = 2000 - {x} where id = 2; \
+    apply batch;  -- assert ok or error
+```
+
+Continuations join with a single space before anything else is parsed,
+so a trailing `-- assert ...` goes on the statement's last line. A
+backslash ending a line inside a string literal would be swallowed the
+same way, which is the one case to write differently.
+
 ### Bindings
 
 A step of the form `name = <statement>` captures the first cell of its
