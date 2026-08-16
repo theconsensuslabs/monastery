@@ -46,3 +46,7 @@ r1: repeat 1000 {
 ---
 
 check: select balance from lab.accounts where customer = 1; -- assert sum(0) = 2000
+
+# no lost updates: 400 transfers of 1 unit out of the payer.
+check: select balance from lab.accounts where customer = 1 and account_id = 1; -- assert ({600})
+check: select balance from lab.accounts where customer = 1 and account_id = 2; -- assert ({1400})
