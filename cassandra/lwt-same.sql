@@ -27,7 +27,10 @@ w1: repeat 200 as op {
   retry 50 {
     a, p = select balance, balance - 1 from lab.accounts where customer = 1 and account_id = 1;
     b, q = select balance, balance + 1 from lab.accounts where customer = 1 and account_id = 2;
-    begin batch update lab.accounts set balance = {p}, op1 = {op} where customer = 1 and account_id = 1 if balance = {a} and op1 < {op}; update lab.accounts set balance = {q} where customer = 1 and account_id = 2 if balance = {b}; apply batch; -- assert ok or error
+    begin batch update lab.accounts set balance = {p}, op1 = {op} \
+      where customer = 1 and account_id = 1 if balance = {a} and op1 < {op}; \
+      update lab.accounts set balance = {q} where customer = 1 and account_id = 2 if balance = {b}; \
+      apply batch;  -- assert ok or error
     select op1 from lab.accounts where customer = 1 and account_id = 1; -- assert ({{op}})
   }
 }
@@ -36,7 +39,10 @@ w2: repeat 200 as op {
   retry 50 {
     a, p = select balance, balance - 1 from lab.accounts where customer = 1 and account_id = 1;
     b, q = select balance, balance + 1 from lab.accounts where customer = 1 and account_id = 2;
-    begin batch update lab.accounts set balance = {p}, op2 = {op} where customer = 1 and account_id = 1 if balance = {a} and op2 < {op}; update lab.accounts set balance = {q} where customer = 1 and account_id = 2 if balance = {b}; apply batch; -- assert ok or error
+    begin batch update lab.accounts set balance = {p}, op2 = {op} \
+      where customer = 1 and account_id = 1 if balance = {a} and op2 < {op}; \
+      update lab.accounts set balance = {q} where customer = 1 and account_id = 2 if balance = {b}; \
+      apply batch;  -- assert ok or error
     select op2 from lab.accounts where customer = 1 and account_id = 1; -- assert ({{op}})
   }
 }

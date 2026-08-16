@@ -15,13 +15,19 @@ insert into lab.accounts (customer, account_id, balance, op1, op2) values (2, 1,
 w1: repeat 200 {
   a, p = select balance, balance - 1 from lab.accounts where customer = 1 and account_id = 1;
   b, q = select balance, balance + 1 from lab.accounts where customer = 2 and account_id = 1;
-  begin batch update lab.accounts set balance = {p} where customer = 1 and account_id = 1 if balance = {a}; update lab.accounts set balance = {q} where customer = 2 and account_id = 1 if balance = {b}; apply batch; -- assert error
+  begin batch \
+    update lab.accounts set balance = {p} where customer = 1 and account_id = 1 if balance = {a}; \
+    update lab.accounts set balance = {q} where customer = 2 and account_id = 1 if balance = {b}; \
+    apply batch;  -- assert error
 }
 
 w2: repeat 200 {
   a, p = select balance, balance - 1 from lab.accounts where customer = 1 and account_id = 1;
   b, q = select balance, balance + 1 from lab.accounts where customer = 2 and account_id = 1;
-  begin batch update lab.accounts set balance = {p} where customer = 1 and account_id = 1 if balance = {a}; update lab.accounts set balance = {q} where customer = 2 and account_id = 1 if balance = {b}; apply batch; -- assert error
+  begin batch \
+    update lab.accounts set balance = {p} where customer = 1 and account_id = 1 if balance = {a}; \
+    update lab.accounts set balance = {q} where customer = 2 and account_id = 1 if balance = {b}; \
+    apply batch;  -- assert error
 }
 
 r1: repeat 1000 {

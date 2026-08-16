@@ -14,11 +14,17 @@ insert into lab.accounts (customer, account_id, balance) values (1, 2, 1000);
 --- concurrent
 
 w1: repeat 400 as x {
-  begin batch update lab.accounts set balance = {x} where customer = 1 and account_id = 1; update lab.accounts set balance = 2000 - {x} where customer = 1 and account_id = 2; apply batch;
+  begin batch \
+    update lab.accounts set balance = {x} where customer = 1 and account_id = 1; \
+    update lab.accounts set balance = 2000 - {x} where customer = 1 and account_id = 2; \
+    apply batch;
 }
 
 w2: repeat 400 as x {
-  begin batch update lab.accounts set balance = 2000 - {x} where customer = 1 and account_id = 1; update lab.accounts set balance = {x} where customer = 1 and account_id = 2; apply batch;
+  begin batch \
+    update lab.accounts set balance = 2000 - {x} where customer = 1 and account_id = 1; \
+    update lab.accounts set balance = {x} where customer = 1 and account_id = 2; \
+    apply batch;
 }
 
 r1: repeat 1500 {

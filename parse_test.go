@@ -234,6 +234,50 @@ func TestAssertSum(t *testing.T) {
 	}
 }
 
+func TestLineContinuation(t *testing.T) {
+	pre, steps, checks, _ := parseString(t, `
+create table t (id int primary key, v int, w int);
+---
+t1: begin batch \
+      update t set v = 1 where id = 1; \
+      update t set w = 2 where id = 1; \
+    apply batch; -- assert ({true})
+t1: select v from t; -- assert ({1})
+t2: repeat 2 {
+  update t \
+    set v = 9 \
+    where id = 1;
+}
+---
+check: select v, w from t; -- assert sum(0, 1) = 3
+`)
+	if len(pre) != 1 {
+		t.Fatalf("preconditions = %d, want 1", len(pre))
+	}
+	// 1 batch + 1 select + 2 unrolled copies of the continued update
+	if len(steps) != 4 {
+		t.Fatalf("steps = %d, want 4", len(steps))
+	}
+	want := "begin batch update t set v = 1 where id = 1; update t set w = 2 where id = 1; apply batch;"
+	if steps[0].sql != want {
+		t.Errorf("joined batch = %q,\n want %q", steps[0].sql, want)
+	}
+	if steps[0].assert.raw != "({true})" {
+		t.Errorf("trailing assert lost: %q", steps[0].assert.raw)
+	}
+	for _, i := range []int{2, 3} {
+		if steps[i].sql != "update t set v = 9 where id = 1;" {
+			t.Errorf("steps[%d].sql = %q", i, steps[i].sql)
+		}
+		if steps[i].clientID != "t2" {
+			t.Errorf("steps[%d].clientID = %q, want t2", i, steps[i].clientID)
+		}
+	}
+	if len(checks) != 1 || len(checks[0].assert.alts) == 0 {
+		t.Errorf("checks = %d, assert lost", len(checks))
+	}
+}
+
 func TestFailureSummary(t *testing.T) {
 	f := newFailureTracker()
 	if got := f.summary(); got != "no assertion failures\n" {

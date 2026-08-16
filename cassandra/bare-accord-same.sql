@@ -16,15 +16,24 @@ insert into lab.accounts (customer, account_id, balance) values (1, 2, 1000);
 --- concurrent
 
 w1: repeat 400 as x {
-  begin transaction update lab.accounts set balance = {x} where customer = 1 and account_id = 1; update lab.accounts set balance = 2000 - {x} where customer = 1 and account_id = 2; commit transaction; -- assert ok
+  begin transaction \
+    update lab.accounts set balance = {x} where customer = 1 and account_id = 1; \
+    update lab.accounts set balance = 2000 - {x} where customer = 1 and account_id = 2; \
+    commit transaction;  -- assert ok
 }
 
 w2: repeat 400 as x {
-  begin transaction update lab.accounts set balance = 2000 - {x} where customer = 1 and account_id = 1; update lab.accounts set balance = {x} where customer = 1 and account_id = 2; commit transaction; -- assert ok
+  begin transaction \
+    update lab.accounts set balance = 2000 - {x} where customer = 1 and account_id = 1; \
+    update lab.accounts set balance = {x} where customer = 1 and account_id = 2; \
+    commit transaction;  -- assert ok
 }
 
 r1: repeat 1500 {
-  begin transaction let x = (select balance from lab.accounts where customer = 1 and account_id = 1); let y = (select balance from lab.accounts where customer = 1 and account_id = 2); select x.balance, y.balance; commit transaction; -- assert sum(0, 1) = 2000
+  begin transaction \
+    let x = (select balance from lab.accounts where customer = 1 and account_id = 1); \
+    let y = (select balance from lab.accounts where customer = 1 and account_id = 2); \
+    select x.balance, y.balance; commit transaction;  -- assert sum(0, 1) = 2000
 }
 
 ---

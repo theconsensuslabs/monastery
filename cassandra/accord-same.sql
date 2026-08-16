@@ -27,20 +27,33 @@ insert into lab.accounts (customer, account_id, balance, op1, op2) values (1, 2,
 
 w1: repeat 200 as op {
   retry 50 {
-    begin transaction let x = (select balance, op1 from lab.accounts where customer = 1 and account_id = 1); if x.balance >= 1 and x.op1 < {op} then update lab.accounts set balance -= 1, op1 = {op} where customer = 1 and account_id = 1; update lab.accounts set balance += 1 where customer = 1 and account_id = 2; end if commit transaction; -- assert ok or error
+    begin transaction \
+      let x = (select balance, op1 from lab.accounts where customer = 1 and account_id = 1); \
+      if x.balance >= 1 and x.op1 < {op} then \
+      update lab.accounts set balance -= 1, op1 = {op} where customer = 1 and account_id = 1; \
+      update lab.accounts set balance += 1 where customer = 1 and account_id = 2; \
+      end if commit transaction;  -- assert ok or error
     select op1 from lab.accounts where customer = 1 and account_id = 1; -- assert ({{op}})
   }
 }
 
 w2: repeat 200 as op {
   retry 50 {
-    begin transaction let x = (select balance, op2 from lab.accounts where customer = 1 and account_id = 1); if x.balance >= 1 and x.op2 < {op} then update lab.accounts set balance -= 1, op2 = {op} where customer = 1 and account_id = 1; update lab.accounts set balance += 1 where customer = 1 and account_id = 2; end if commit transaction; -- assert ok or error
+    begin transaction \
+      let x = (select balance, op2 from lab.accounts where customer = 1 and account_id = 1); \
+      if x.balance >= 1 and x.op2 < {op} then \
+      update lab.accounts set balance -= 1, op2 = {op} where customer = 1 and account_id = 1; \
+      update lab.accounts set balance += 1 where customer = 1 and account_id = 2; \
+      end if commit transaction;  -- assert ok or error
     select op2 from lab.accounts where customer = 1 and account_id = 1; -- assert ({{op}})
   }
 }
 
 r1: repeat 1000 {
-  begin transaction let x = (select balance from lab.accounts where customer = 1 and account_id = 1); let y = (select balance from lab.accounts where customer = 1 and account_id = 2); select x.balance, y.balance; commit transaction; -- assert sum(0, 1) = 2000
+  begin transaction \
+    let x = (select balance from lab.accounts where customer = 1 and account_id = 1); \
+    let y = (select balance from lab.accounts where customer = 1 and account_id = 2); \
+    select x.balance, y.balance; commit transaction;  -- assert sum(0, 1) = 2000
 }
 
 ---

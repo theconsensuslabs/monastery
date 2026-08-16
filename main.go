@@ -310,15 +310,40 @@ func isIdentifier(s string) bool {
 // preconditions, steps, and post-run checks. Marking the first separator
 // `--- concurrent` lets each client run its own steps at full speed instead
 // of the file specifying one global interleaving.
+//
+// A line ending in `\` continues onto the next, which keeps a long
+// statement readable. Continuations join with a single space, so a
+// trailing ` -- assert ...` belongs on the last line of the statement.
 func parseScript(f *os.File) (preconditions []string, steps, checks []step, concurrent bool, err error) {
 	scanner := bufio.NewScanner(f)
 	var pre, body, post []string
 	section := 0
+	var lines []string
+	pending := ""
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		text := strings.TrimSpace(scanner.Text())
+		if pending == "" && (text == "" || strings.HasPrefix(text, "#")) {
 			continue
 		}
+		if pending != "" {
+			text = pending + " " + text
+		}
+		if joined, found := strings.CutSuffix(text, `\`); found {
+			pending = strings.TrimSpace(joined)
+			continue
+		}
+		pending = ""
+		lines = append(lines, text)
+	}
+	// A dangling `\` on the last line has nothing to join to.
+	if pending != "" {
+		lines = append(lines, pending)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, nil, nil, false, err
+	}
+
+	for _, line := range lines {
 		if strings.HasPrefix(line, "---") {
 			if section == 0 && strings.TrimSpace(strings.TrimPrefix(line, "---")) == "concurrent" {
 				concurrent = true
@@ -334,9 +359,6 @@ func parseScript(f *os.File) (preconditions []string, steps, checks []step, conc
 		default:
 			post = append(post, line)
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, nil, nil, false, err
 	}
 	// no separator: everything was steps, not preconditions
 	if section == 0 {

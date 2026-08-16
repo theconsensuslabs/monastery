@@ -18,13 +18,19 @@ insert into lab.accounts (customer, account_id, balance, op1, op2) values (2, 1,
 w1: repeat 200 {
   p = select balance - 1 from lab.accounts where customer = 1 and account_id = 1;
   q = select balance + 1 from lab.accounts where customer = 2 and account_id = 1;
-  begin batch update lab.accounts set balance = {p} where customer = 1 and account_id = 1; update lab.accounts set balance = {q} where customer = 2 and account_id = 1; apply batch;
+  begin batch \
+    update lab.accounts set balance = {p} where customer = 1 and account_id = 1; \
+    update lab.accounts set balance = {q} where customer = 2 and account_id = 1; \
+    apply batch;
 }
 
 w2: repeat 200 {
   p = select balance - 1 from lab.accounts where customer = 1 and account_id = 1;
   q = select balance + 1 from lab.accounts where customer = 2 and account_id = 1;
-  begin batch update lab.accounts set balance = {p} where customer = 1 and account_id = 1; update lab.accounts set balance = {q} where customer = 2 and account_id = 1; apply batch;
+  begin batch \
+    update lab.accounts set balance = {p} where customer = 1 and account_id = 1; \
+    update lab.accounts set balance = {q} where customer = 2 and account_id = 1; \
+    apply batch;
 }
 
 r1: repeat 1000 {
