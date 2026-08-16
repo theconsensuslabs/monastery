@@ -1,6 +1,6 @@
 module github.com/theconsensus/monastery
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/apache/cassandra-gocql-driver/v2 v2.1.2
