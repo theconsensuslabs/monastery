@@ -5,6 +5,10 @@
 # A logged batch is atomic: if any mutation is applied, all of them
 # eventually are. It is not isolated, and it does not cover the two reads
 # that computed the values.
+#
+# op1 and op2 are idempotency keys for the scripts whose writes can carry
+# a condition. An unconditional batch carries none, and adding one is
+# what makes it lwt-same.sql.
 
 create keyspace if not exists lab with replication = {'class':'NetworkTopologyStrategy','datacenter1':3};
 drop table if exists lab.accounts;

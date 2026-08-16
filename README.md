@@ -478,6 +478,18 @@ letting CQL compute the complement, so nothing is read and no update can
 be lost. What the reader sees then measures atomicity and isolation
 alone.
 
+Two choices are being varied across the set, whether the writes are
+grouped and whether they carry a condition, and `lwt-unbatched-*` fills
+the cell that has a condition but no group. Each of its writes is its
+own lightweight transaction, so every row is compare-and-set and no
+update is lost, while a transfer whose second leg fails still leaves the
+first behind.
+
+| | no condition | condition |
+|-----------|----------------|-----------------|
+| ungrouped | `plain-*`      | `lwt-unbatched-*` |
+| batched   | `batch-*`      | `lwt-*`         |
+
 ```
 ./monastery cql '127.0.0.1,127.0.0.2?consistency=quorum&timeout=30s' cassandra/accord-cross.sql
 ```

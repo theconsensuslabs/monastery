@@ -3,6 +3,9 @@
 # customer is the partition key, so (1,1) and (2,1) are in different
 # partitions. Paxos runs per partition and a conditional batch cannot
 # span two, so every write here is rejected and the balances never move.
+#
+# op1 and op2 are the idempotency keys lwt-same.sql uses. Every write here
+# is rejected before a condition is ever evaluated, so they stay at 0.
 
 create keyspace if not exists lab with replication = {'class':'NetworkTopologyStrategy','datacenter1':3};
 drop table if exists lab.accounts;

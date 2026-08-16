@@ -5,8 +5,9 @@
 # Plain CQL rejects arithmetic on a non-counter column, so a transfer is
 # two reads and two writes with nothing tying them together.
 #
-# op1 and op2 are the sequence columns lwt-same.sql writes. Unused here;
-# the schema is common to all eight scripts.
+# op1 and op2 are idempotency keys for the scripts whose writes can carry
+# a condition. A plain UPDATE carries none, so it can record an operation
+# number but cannot refuse to apply one twice.
 
 create keyspace if not exists lab with replication = {'class':'NetworkTopologyStrategy','datacenter1':3};
 drop table if exists lab.accounts;
