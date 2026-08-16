@@ -5,3 +5,6 @@ monastery
 testdb
 *.db
 .claude
+logfile
+.hermitage-logs/
+.DS_Store

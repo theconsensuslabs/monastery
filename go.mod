@@ -3,6 +3,7 @@ module github.com/theconsensus/monastery
 go 1.25.0
 
 require (
+	github.com/apache/cassandra-gocql-driver/v2 v2.1.2
 	github.com/gdamore/tcell/v2 v2.13.9
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/lib/pq v1.12.3
@@ -16,4 +17,5 @@ require (
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/term v0.37.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
+	gopkg.in/inf.v0 v0.9.1 // indirect
 )

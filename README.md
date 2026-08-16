@@ -9,6 +9,7 @@ $ git clone https://github.com/theconsensuslabs/monastery
 $ cd monastery
 $ go build -buildmode=plugin -o postgres.so ./plugins/postgres/ # Optional, for Postgres.
 $ go build -buildmode=plugin -o mysql.so ./plugins/mysql/ # Optional, for MariaDB or MySQL.
+$ go build -buildmode=plugin -o cql.so ./plugins/cql/ # Optional, for Cassandra.
 $ go build
 ```
 
@@ -245,10 +246,20 @@ exits non-zero if any assertion fails.
 | `-- assert ok`                  | the statement returned no error            |
 | `-- assert ()`                  | the statement returned no rows             |
 | `-- assert ({1, 10}, {2, 20})`  | the rows match exactly, no order           |
+| `-- assert sum(0) = 400`        | column 0, summed across all rows, totals 400 |
+
+`sum(<col>, ...) = N` states a conservation invariant, the thing that
+must stay true about a result rather than the exact values in it. The
+indexes name which cells of each row count, so `sum(0) = 400` totals a
+one-column result over its rows and `sum(0, 1) = 400` totals a pair
+returned in one row. It is the assertion to reach for when the values
+move but their total must not, and on an engine that cannot compute
+the total server-side it is often the only option.
 
 Alternatives can be chained with ` or ` and the assertion holds if any of
-them matches — useful when a step is allowed to either succeed with a
-specific result or fail with an error depending on the isolation level:
+them matches, which is useful when a step is allowed to either succeed
+with a specific result or fail with an error depending on the isolation
+level:
 
 ```sql
 t1: select * from test;  -- assert ({1, 12}, {2, 22}) or ({1, 11}, {2, 21})
@@ -262,11 +273,17 @@ note and discarded:
 t2: select * from test;  -- assert ({1, 11}, {2, 20}) or ({1, 10}, {2, 20})  # latter under SI
 ```
 
-## Group invariants
+### Group invariants
 
 Tag related steps with `-- group <name>` and monastery emits a
 synthetic check row after the run. There are two modes, picked
 automatically:
+
+Groups belong to deterministic-schedule scripts. Their invariants
+reason over a small, fixed set of steps, and a `repeat`-unrolled
+workload records every copy into the group, which makes the check
+meaningless. Concurrent scripts state invariants with per-step asserts
+and the check section instead.
 
 ### Error mode (no labeled assertions in the group)
 
@@ -301,14 +318,14 @@ t2: select * from test; -- group final; assert t2committed => ({1, 12}, {2, 22})
 Each branch carries an arbitrary label naming a serial-equivalence
 class. Per-step status passes if any branch matches (same as today's
 `or`). The group additionally requires a single label to be feasible
-across all members — i.e., every member's matched branch set agrees on
-some L. Mixed outcomes (e.g. one read sees `t2committed`, the other
+across all members, meaning every member's matched branch set agrees
+on some L. Mixed outcomes (e.g. one read sees `t2committed`, the other
 sees `t2aborted`) fail the group as `no consistent schedule`.
 
 Unlabeled `or` branches act as wildcards for the group check. Members
 without an `assert` directive (e.g. `commit;`) are unconstrained. Pick
 the mode that fits the invariant: schedule mode catches torn views
-across multiple reads; error mode is for non-deterministic abort
+across multiple reads. Error mode is for non-deterministic abort
 victims.
 
 ### Composing
@@ -322,6 +339,81 @@ t1: commit; -- assert ok; group cycle1
 Group checks are skipped when the run is interrupted (Ctrl-C), since a
 missing member would spuriously fail the invariant.
 
+## Concurrent workloads
+
+A *Hermitage* script names one exact interleaving. To ask a different kind
+of question (*does this hold under whatever interleaving the engine
+produces?*) a Monastery script can instead let every client run flat out and
+assert about the state they leave behind.
+
+This kind of script has three sections rather than two. Marking the first
+separator `--- concurrent` releases the clients to run at their own
+speed instead of stepping through one global order, and anything after
+the second separator runs once, after every client has finished.
+
+With no interleaving to watch and enough steps to overwhelm the table,
+a concurrent run defaults to `-events-only` output. Pass
+`-events-only=false` to get the TUI anyway.
+
+For example:
+
+```sql
+create table accounts (id int primary key, balance int);
+insert into accounts values (1, 200), (2, 200);
+
+--- concurrent
+
+w1: repeat 50 { ... }
+r1: repeat 300 { select balance from accounts; -- assert sum(0) = 400 }
+
+---
+
+check: select balance from accounts; -- assert sum(0) = 400
+```
+
+### repeat and retry
+
+`repeat N { ... }` unrolls its body N times at parse time. Lines inside
+a block carry no label, inheriting the block's. `repeat N as v { ... }`
+also substitutes `{v}` with the iteration number, 1 to N, giving each
+copy an identity that a nested retry re-runs unchanged.
+
+`retry N { ... }` runs its body and, if any member errors or fails its
+assertion, runs the whole block again, up to N times. A losing attempt
+is reported as `RETRY` rather than `FAIL` and does not count against the
+exit status. Only the last attempt is scored. This is how a script
+expresses a compare-and-set loop, where a write that lost a race is
+expected and is meant to be re-proposed rather than reported:
+
+```sql
+w1: repeat 50 {
+  retry 20 {
+    a = select balance from accounts where id = 1;
+    update accounts set balance = 0 where id = 1 if balance = {a}; -- assert ({true})
+  }
+}
+```
+
+A step's assertion, where it has one, is what decides whether the block
+succeeded. `-- assert error` on a statement the engine is supposed to
+reject therefore ends the block rather than retrying it. Blocks nest.
+
+### Bindings
+
+A step of the form `name = <statement>` captures the first cell of its
+first result row, and later steps *on the same client* interpolate it as
+`{name}`. Several names separated by commas take the cells of that row
+positionally.
+
+```sql
+w1: a, next = select balance, balance - 1 from accounts where id = 1;
+w1: update accounts set balance = {next} where id = 1 if balance = {a};
+```
+
+Bindings are per-client, so two clients running the same script text
+each keep their own. Values are interpolated bare, so a script quotes
+text itself: `where name = '{n}'`.
+
 ## Per-driver script overrides
 
 Some anomalies surface differently under SI/SSI vs. lock-based
@@ -330,5 +422,21 @@ loading `foo.sql`, monastery first looks for `foo.sql.<driver>` (e.g.
 `foo.sql.mysql`) and uses that file if it exists. The actual path
 loaded is recorded in the `session_start` event's `script` field.
 
-`run-hermitage.sh` doesn't need any changes — its `*.sql` glob won't
+`run-hermitage.sh` doesn't need any changes. Its `*.sql` glob won't
 match `*.sql.<driver>`, but the Go runner does the resolution.
+
+## Cassandra
+
+`cassandra/` holds a same money-transfer workload written four ways
+(`plain`, `batch`, `lwt`, `accord`), each in a `-same` and a `-cross`
+variant, for a pair of accounts that share a partition and a pair that
+does not. Every script runs two writers and one reader against one pair
+and measures atomicity, lost updates, and isolation.
+
+```
+./monastery cql '127.0.0.1,127.0.0.2?consistency=quorum&timeout=30s' cassandra/accord-cross.sql
+```
+
+Cassandra has no isolation levels, so the level argument is omitted.
+What varies between the workloads is the statement form. DSN options
+and CQL-specific behavior are documented in `plugins/cql/driver.go`.

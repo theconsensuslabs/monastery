@@ -38,12 +38,15 @@ const (
 	assertError assertKind = iota
 	assertOK
 	assertRows
+	assertSum
 )
 
 type assertAlt struct {
-	kind  assertKind
-	rows  [][]string
-	label string // schedule label, empty = unlabeled (wildcard for group consistency)
+	kind    assertKind
+	rows    [][]string
+	sum     float64
+	sumCols []int  // column indexes summed by `sum(0, 1) = N`
+	label   string // schedule label, empty = unlabeled (wildcard for group consistency)
 }
 
 type assertion struct {
@@ -60,6 +63,14 @@ type step struct {
 	sql      string
 	assert   assertion
 	group    string
+	// binds names variables holding the cells of this step's first result
+	// row, positionally. Later steps on the same client interpolate them
+	// as {name}.
+	binds []string
+	// body and attempts describe a `retry N { ... }` block: run body in
+	// order, and if a member errors or fails its assert, run it all again.
+	body     []step
+	attempts int
 }
 
 // commentMarker requires surrounding whitespace so it doesn't collide with
@@ -134,8 +145,28 @@ func parseAssertAlt(s string) (assertAlt, error) {
 	case "ok":
 		return assertAlt{kind: assertOK, label: label}, nil
 	}
+	if rest, found := strings.CutPrefix(s, "sum("); found {
+		list, after, closed := strings.Cut(rest, ")")
+		val, hasEq := strings.CutPrefix(strings.TrimSpace(after), "=")
+		if !closed || !hasEq {
+			return assertAlt{}, fmt.Errorf("invalid assert %q: expected `sum(<col>, ...) = N`", s)
+		}
+		var cols []int
+		for _, f := range strings.Split(list, ",") {
+			i, err := strconv.Atoi(strings.TrimSpace(f))
+			if err != nil || i < 0 {
+				return assertAlt{}, fmt.Errorf("invalid assert %q: bad column index %q", s, f)
+			}
+			cols = append(cols, i)
+		}
+		n, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
+		if err != nil {
+			return assertAlt{}, fmt.Errorf("invalid assert %q: sum needs a number", s)
+		}
+		return assertAlt{kind: assertSum, sum: n, sumCols: cols, label: label}, nil
+	}
 	if !strings.HasPrefix(s, "(") || !strings.HasSuffix(s, ")") {
-		return assertAlt{}, fmt.Errorf("invalid assert %q: expected `error`, `ok`, or `({a, b}, ...)`", s)
+		return assertAlt{}, fmt.Errorf("invalid assert %q: expected `error`, `ok`, `sum(<col>, ...) = N`, or `({a, b}, ...)`", s)
 	}
 	body := strings.TrimSpace(s[1 : len(s)-1])
 	a := assertAlt{kind: assertRows, label: label}
@@ -236,45 +267,213 @@ func parseStep(line string) (step, error) {
 	if query == "" {
 		return step{}, nil
 	}
-	return step{strings.TrimSpace(parts[0]), query, a, group}, nil
+	binds, query := splitBind(query)
+	return step{clientID: strings.TrimSpace(parts[0]), sql: query, assert: a, group: group, binds: binds}, nil
 }
 
-func parseScript(f *os.File) (preconditions []string, steps []step, err error) {
+// splitBind recognises `name = <statement>` and `name, other = <statement>`,
+// returning the variable names plus the statement. Every left-side element
+// must be a bare identifier. Anything else is a statement such as
+// `update ... set col = ...`.
+func splitBind(query string) (binds []string, rest string) {
+	idx := strings.Index(query, "=")
+	if idx == -1 {
+		return nil, query
+	}
+	remainder := strings.TrimSpace(query[idx+1:])
+	if remainder == "" {
+		return nil, query
+	}
+	for _, name := range strings.Split(query[:idx], ",") {
+		name = strings.TrimSpace(name)
+		if name == "" || !isIdentifier(name) {
+			return nil, query
+		}
+		binds = append(binds, name)
+	}
+	return binds, remainder
+}
+
+func isIdentifier(s string) bool {
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '_':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// parseScript reads up to three sections separated by `---`:
+// preconditions, steps, and post-run checks. Marking the first separator
+// `--- concurrent` lets each client run its own steps at full speed instead
+// of the file specifying one global interleaving.
+func parseScript(f *os.File) (preconditions []string, steps, checks []step, concurrent bool, err error) {
 	scanner := bufio.NewScanner(f)
-	var pre, post []string
-	seenSeparator := false
+	var pre, body, post []string
+	section := 0
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if line == "---" {
-			seenSeparator = true
+		if strings.HasPrefix(line, "---") {
+			if section == 0 && strings.TrimSpace(strings.TrimPrefix(line, "---")) == "concurrent" {
+				concurrent = true
+			}
+			section++
 			continue
 		}
-		if seenSeparator {
-			post = append(post, line)
-		} else {
+		switch section {
+		case 0:
 			pre = append(pre, line)
+		case 1:
+			body = append(body, line)
+		default:
+			post = append(post, line)
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, false, err
 	}
 	// no separator: everything was steps, not preconditions
-	if !seenSeparator {
-		post, pre = pre, nil
+	if section == 0 {
+		body, pre = pre, nil
 	}
-	for _, line := range post {
-		s, err := parseStep(line)
+	if steps, err = expandSteps(body); err != nil {
+		return nil, nil, nil, false, err
+	}
+	if checks, err = expandSteps(post); err != nil {
+		return nil, nil, nil, false, err
+	}
+	return pre, steps, checks, concurrent, nil
+}
+
+// expandSteps parses lines into steps, expanding block forms:
+// `repeat N { ... }` unrolls into N copies and `retry N { ... }` becomes one
+// step the client re-runs on failure. Blocks nest.
+func expandSteps(lines []string) ([]step, error) {
+	return expandBlock(lines, "")
+}
+
+// expandBlock parses lines that belong to one nesting level. Lines inside a
+// block carry no label of their own, so the enclosing block's is passed down.
+func expandBlock(lines []string, inherited string) ([]step, error) {
+	var out []step
+	for i := 0; i < len(lines); i++ {
+		head, isBlock := parseBlockHeader(lines[i], inherited)
+		if !isBlock {
+			line := lines[i]
+			if inherited != "" {
+				line = inherited + ": " + line
+			}
+			s, err := parseStep(line)
+			if err != nil {
+				return nil, err
+			}
+			if s.sql != "" {
+				out = append(out, s)
+			}
+			continue
+		}
+		body, end, err := collectBlock(lines, i)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		if s.sql != "" {
-			steps = append(steps, s)
+		i = end
+
+		if head.keyword == "retry" {
+			inner, err := expandBlock(body, head.label)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, step{clientID: head.label, body: inner, attempts: head.count})
+			continue
+		}
+		for n := 1; n <= head.count; n++ {
+			inner, err := expandBlock(substitute(body, head.loopVar, n), head.label)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, inner...)
 		}
 	}
-	return pre, steps, nil
+	return out, nil
+}
+
+// substitute replaces {name} with the iteration number. An unnamed loop
+// returns the lines unchanged.
+func substitute(lines []string, name string, n int) []string {
+	if name == "" {
+		return lines
+	}
+	out := make([]string, len(lines))
+	for i, line := range lines {
+		out[i] = strings.ReplaceAll(line, "{"+name+"}", strconv.Itoa(n))
+	}
+	return out
+}
+
+// collectBlock returns the body lines of the block whose header sits at
+// start, plus the index of its closing brace.
+func collectBlock(lines []string, start int) (body []string, end int, err error) {
+	depth := 1
+	for i := start + 1; i < len(lines); i++ {
+		if lines[i] == "}" {
+			if depth--; depth == 0 {
+				return body, i, nil
+			}
+		} else if _, ok := parseBlockHeader(lines[i], "_"); ok {
+			depth++
+		}
+		body = append(body, lines[i])
+	}
+	return nil, 0, fmt.Errorf("block %q is not closed with }", lines[start])
+}
+
+type blockHeader struct {
+	label   string
+	keyword string // repeat or retry
+	loopVar string // the `as n` name, empty when there is none
+	count   int
+}
+
+// parseBlockHeader matches `t1: repeat 200 {` and `t1: repeat 200 as n {` at
+// the top level, and the same without a label inside a block, where the label
+// comes from the enclosing one.
+func parseBlockHeader(line, inherited string) (blockHeader, bool) {
+	label, rest := inherited, strings.TrimSpace(line)
+	if inherited == "" {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) < 2 {
+			return blockHeader{}, false
+		}
+		label, rest = strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	}
+	if !strings.HasSuffix(rest, "{") {
+		return blockHeader{}, false
+	}
+	for _, kw := range []string{"repeat", "retry"} {
+		if !strings.HasPrefix(rest, kw+" ") {
+			continue
+		}
+		spec := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(rest, kw+" "), "{"))
+		var loopVar string
+		if before, after, found := strings.Cut(spec, " as "); found {
+			spec, loopVar = strings.TrimSpace(before), strings.TrimSpace(after)
+			if !isIdentifier(loopVar) {
+				return blockHeader{}, false
+			}
+		}
+		n, err := strconv.Atoi(spec)
+		if err != nil || n <= 0 {
+			return blockHeader{}, false
+		}
+		return blockHeader{label, kw, loopVar, n}, true
+	}
+	return blockHeader{}, false
 }
 
 // evalAssertAlt returns true if a single alternative is satisfied.
@@ -286,6 +485,26 @@ func evalAssertAlt(a assertAlt, runErr error, rows [][]any) bool {
 		return runErr != nil
 	case assertOK:
 		return runErr == nil
+	case assertSum:
+		// A conservation invariant: the indexed cells of every row added
+		// together.
+		if runErr != nil || len(rows) == 0 {
+			return false
+		}
+		var total float64
+		for _, row := range rows {
+			for _, i := range a.sumCols {
+				if i >= len(row) {
+					return false
+				}
+				n, ok := numericValue(row[i])
+				if !ok {
+					return false
+				}
+				total += n
+			}
+		}
+		return total == a.sum
 	case assertRows:
 		if runErr != nil || len(rows) != len(a.rows) {
 			return false
@@ -308,6 +527,21 @@ func evalAssertAlt(a assertAlt, runErr error, rows [][]any) bool {
 		return true
 	}
 	return false
+}
+
+// numericValue coerces a result cell to a number, falling back to its text
+// form for drivers that hand back []byte or string.
+func numericValue(v any) (float64, bool) {
+	switch t := v.(type) {
+	case nil:
+		return 0, false
+	case float64:
+		return t, true
+	case int64:
+		return float64(t), true
+	}
+	n, err := strconv.ParseFloat(strings.TrimSpace(formatValue(v)), 64)
+	return n, err == nil
 }
 
 func rowEqual(got []any, want []string) bool {
@@ -442,12 +676,12 @@ func formatRows(rows [][]any) string {
 // `-- group <name>`. After all workers exit, evalGroups walks each named
 // group in one of two modes:
 //   - error mode (no member has any assertion): at least one member must
-//     have errored — the cycle-victim invariant for engines where the
-//     choice of victim is non-deterministic.
+//     have errored. This is the cycle-victim invariant for engines where
+//     the choice of victim is non-deterministic.
 //   - schedule mode (at least one member has a labeled assertion branch):
 //     there must exist some label L that every asserting member is
-//     compatible with — i.e., the members' results agree on a single
-//     serial schedule. See evalScheduleGroup.
+//     compatible with. In other words, the members' results agree on a
+//     single serial schedule. See evalScheduleGroup.
 type groupTracker struct {
 	mu      sync.Mutex
 	members map[string][]groupMember
@@ -629,6 +863,12 @@ func txnOp(sqlText string) string {
 	s := strings.ToLower(strings.TrimSpace(sqlText))
 	switch {
 	case strings.HasPrefix(s, "begin"), strings.HasPrefix(s, "start transaction"):
+		// CQL's BEGIN BATCH and BEGIN TRANSACTION carry their own terminator
+		// and are single statements. A bare BEGIN opens a session
+		// transaction.
+		if strings.Contains(s, "apply batch") || strings.Contains(s, "commit transaction") {
+			return ""
+		}
 		return "begin"
 	case strings.HasPrefix(s, "commit"):
 		return "commit"
@@ -644,9 +884,51 @@ func txnOp(sqlText string) string {
 // until end of transaction block".
 var errTxnAborted = errors.New("current transaction is aborted, statement ignored")
 
+// expandBinds substitutes {name} with values captured by earlier steps on
+// the same client. Set literals like {123} are untouched because a bind name
+// must be an identifier.
+func expandBinds(sqlText string, binds map[string]string) string {
+	if len(binds) == 0 || !strings.Contains(sqlText, "{") {
+		return sqlText
+	}
+	for name, val := range binds {
+		sqlText = strings.ReplaceAll(sqlText, "{"+name+"}", val)
+	}
+	return sqlText
+}
+
+// bindLiteral renders a result cell for interpolation. Values are inserted
+// bare, so a script quotes text itself: where name = '{n}'.
+func bindLiteral(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return "null"
+	case []byte:
+		return string(t)
+	case string:
+		return t
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
+
 func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, sc *screen, lg *logger, failures *atomic.Int64, groups *groupTracker) {
 	var inTxn, txnAborted bool
-	for s := range ch {
+	// Bindings are per-client: two clients running the same script text
+	// each keep their own `a`, `b`, and so on.
+	binds := map[string]string{}
+
+	// exec runs one statement and reports whether it succeeded. attempt and
+	// attempts locate it within an enclosing retry block, where only the
+	// final attempt is scored.
+	exec := func(s step, attempt, attempts int) bool {
+		scored := attempt == attempts
+		s.sql = expandBinds(s.sql, binds)
 		start := time.Now()
 
 		lg.write(map[string]any{
@@ -747,6 +1029,14 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 			}
 		}
 
+		if runErr == nil && len(resultRows) > 0 {
+			for i, name := range s.binds {
+				if i < len(resultRows[0]) {
+					binds[name] = bindLiteral(resultRows[0][i])
+				}
+			}
+		}
+
 		end := time.Now()
 		event := map[string]any{
 			"event":      "query_end",
@@ -767,6 +1057,9 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 		if suppressed {
 			event["suppressed"] = true
 		}
+		if attempts > 1 {
+			event["attempt"] = attempt
+		}
 		if runErr != nil {
 			event["error"] = runErr.Error()
 			row.err = runErr.Error()
@@ -777,6 +1070,10 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 			row.results = formatRows(resultRows)
 		}
 		status, matched := evalAssert(s.assert, runErr, resultRows)
+		// A losing attempt inside a retry block reports RETRY, not FAIL.
+		if status == "FAIL" && !scored {
+			status = "RETRY"
+		}
 		row.assertStatus = status
 		if status != "" {
 			event["assert_status"] = status
@@ -784,9 +1081,38 @@ func clientWork(ctx context.Context, id string, conn *sql.Conn, ch <-chan step, 
 				failures.Add(1)
 			}
 		}
-		groups.record(s.group, id, s.sql, runErr != nil, len(s.assert.alts) > 0, matched)
+		if scored {
+			groups.record(s.group, id, s.sql, runErr != nil, len(s.assert.alts) > 0, matched)
+		}
 		lg.write(event)
 		sc.updateRow(idx, row)
+		// A step's assertion, where it has one, defines success: `-- assert
+		// error` succeeds when the statement was rejected.
+		if len(s.assert.alts) > 0 {
+			return status == "OK"
+		}
+		return runErr == nil
+	}
+
+	for s := range ch {
+		if s.body == nil {
+			exec(s, 1, 1)
+			continue
+		}
+		for attempt := 1; attempt <= s.attempts; attempt++ {
+			done := true
+			for _, inner := range s.body {
+				// The rest of the block is premised on this statement, so a
+				// failure starts the next attempt from the top.
+				if !exec(inner, attempt, s.attempts) {
+					done = false
+					break
+				}
+			}
+			if done {
+				break
+			}
+		}
 	}
 }
 
@@ -853,6 +1179,18 @@ func defaultPluginDir() string {
 	return filepath.Dir(exe)
 }
 
+// flagWasSet reports whether the flag was given on the command line, as
+// opposed to holding its default value.
+func flagWasSet(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -870,20 +1208,28 @@ func run() error {
 	flag.Parse()
 
 	args := flag.Args()
-	if len(args) < 4 {
-		return errors.New("usage: monastery [-interval <duration>] [-interactive] [-events-only] [-markdown] [-log <path>] <driver> <dsn> <isolation level> <script>\n" +
+	if len(args) < 3 {
+		return errors.New("usage: monastery [-interval <duration>] [-interactive] [-events-only] [-markdown] [-log <path>] <driver> <dsn> [isolation level] <script>\n" +
 			"  -interval duration  delay between steps (default 3s, e.g. 500ms, 1m)\n" +
 			"  -interactive        wait for keypress before each step instead of using interval\n" +
 			"  -events-only        skip the TUI and stream JSON events to stdout\n" +
 			"  -markdown           emit the final result as a markdown table instead of the box-drawn table\n" +
 			"  -log path           json log file (default monastery.jsonl)\n" +
 			"  isolation levels: read-uncommitted, read-committed, repeatable-read, serializable\n" +
-			"  drivers: mysql, postgres (loaded from <driver>.so plugin)\n" +
+			"    (drivers without them, like cql, omit the argument)\n" +
+			"  drivers: mysql, postgres, cql (loaded from <driver>.so plugin)\n" +
 			"  mysql:    root:pass@tcp(127.0.0.1:3306)/dbname\n" +
-			"  postgres: host=localhost user=postgres dbname=test sslmode=disable")
+			"  postgres: host=localhost user=postgres dbname=test sslmode=disable\n" +
+			"  cql:      127.0.0.1,127.0.0.2?consistency=quorum&timeout=30s")
 	}
 
-	driver, dsn, isolationLevel, scriptPath := args[0], args[1], args[2], args[3]
+	driver, dsn := args[0], args[1]
+	var isolationLevel, scriptPath string
+	if len(args) == 3 {
+		scriptPath = args[2]
+	} else {
+		isolationLevel, scriptPath = args[2], args[3]
+	}
 
 	pluginPath := filepath.Join(*pluginDir, driver+".so")
 	p, err := plugin.Open(pluginPath)
@@ -900,6 +1246,9 @@ func run() error {
 	}
 	setSQL := isolationSQLFn(isolationLevel)
 	if setSQL == "" {
+		if isolationLevel == "" {
+			return fmt.Errorf("driver %s requires an isolation level", driver)
+		}
 		return fmt.Errorf("unknown isolation level %q for driver %s", isolationLevel, driver)
 	}
 
@@ -930,9 +1279,16 @@ func run() error {
 	}
 	defer f.Close()
 
-	preconditions, steps, err := parseScript(f)
+	preconditions, steps, checks, concurrent, err := parseScript(f)
 	if err != nil {
 		return fmt.Errorf("parse script: %w", err)
+	}
+
+	// A concurrent run has no interleaving to watch and enough steps to
+	// overwhelm the table, so it defaults to streaming events. An explicit
+	// -events-only=false still gets the TUI.
+	if concurrent && !flagWasSet("events-only") {
+		*eventsOnly = true
 	}
 
 	for i, p := range preconditions {
@@ -940,6 +1296,9 @@ func run() error {
 	}
 	for i := range steps {
 		steps[i].sql = strings.ReplaceAll(steps[i].sql, "$SHOW_ISOLATION", showSQL)
+	}
+	for i := range checks {
+		checks[i].sql = strings.ReplaceAll(checks[i].sql, "$SHOW_ISOLATION", showSQL)
 	}
 
 	db, err := sql.Open(driver, dsn)
@@ -1086,7 +1445,12 @@ func run() error {
 		}
 	}
 
-	if *interactive {
+	if concurrent {
+		// Hand every client its whole step list at once, so each runs at
+		// its own pace with no globally specified interleaving. Channels
+		// are buffered to len(steps), so this never blocks.
+		dispatch(func() bool { return true })
+	} else if *interactive {
 		dispatch(func() bool {
 			select {
 			case <-ctx.Done():
@@ -1112,6 +1476,31 @@ func run() error {
 		close(ch)
 	}
 	wg.Wait()
+
+	// Post-run checks: aggregate invariants over the settled state, which is
+	// where assertions belong when the run had no specified interleaving.
+	if !interrupted && len(checks) > 0 {
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			return fmt.Errorf("get conn for checks: %w", err)
+		}
+		workerConnsMu.Lock()
+		workerConns = append(workerConns, conn)
+		workerConnsMu.Unlock()
+
+		ch := make(chan step, len(checks))
+		var checkWG sync.WaitGroup
+		checkWG.Add(1)
+		go func() {
+			defer checkWG.Done()
+			clientWork(ctx, "check", conn, ch, sc, lg, &failures, groups)
+		}()
+		for _, s := range checks {
+			ch <- s
+		}
+		close(ch)
+		checkWG.Wait()
+	}
 
 	// Group invariants are only meaningful when every member ran. After an
 	// interrupt, missing members would spuriously fail their group.
